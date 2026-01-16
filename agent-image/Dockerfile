@@ -1,7 +1,9 @@
 # Multi-language Claude Agent Image
 # Provides an isolated environment with Claude Code in YOLO mode
 
-FROM ubuntu:24.04
+# Pin to specific digest for reproducible builds
+# To update: docker pull ubuntu:24.04 && docker inspect ubuntu:24.04 --format='{{index .RepoDigests 0}}'
+FROM ubuntu:24.04@sha256:7a398144c5a2fa7dbd9362e460779dc6659bd9b19df50f724250c62ca7812eb3
 
 # Avoid interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
