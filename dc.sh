@@ -12,7 +12,7 @@ export HOST_GID=$(id -g)
 export HOST_HOME="$HOME"
 export PROJECTS_ROOT="${PROJECTS_ROOT:-$HOME}"
 export HOST_CLAUDE_DIR="${HOST_CLAUDE_DIR:-$HOME/.claude}"
-export HOST_CONFIG_DIR="${HOST_CONFIG_DIR:-$HOME/.config/docker-agent-mcp}"
+export HOST_CONFIG_DIR="${HOST_CONFIG_DIR:-$HOME/.config/pinocchio}"
 
 # Run docker compose with all arguments passed through
 exec docker compose "$@"

@@ -41,7 +41,7 @@ Add to your Claude Code MCP settings (`~/.config/claude-code/settings.json`):
 ```json
 {
   "mcpServers": {
-    "docker-agent": {
+    "pinocchio": {
       "command": "/path/to/pinocchio/run-mcp.sh"
     }
   }
@@ -149,7 +149,7 @@ pinocchio/
 |----------|---------|-------------|
 | `PROJECTS_ROOT` | `$HOME` | Root directory for workspaces |
 | `HOST_CLAUDE_DIR` | `~/.claude` | Claude credentials location |
-| `HOST_CONFIG_DIR` | `~/.config/docker-agent-mcp` | Pinocchio config directory |
+| `HOST_CONFIG_DIR` | `~/.config/pinocchio` | Pinocchio config directory |
 | `HOST_GH_CONFIG` | `~/.config/gh` | GitHub CLI config |
 | `ABSOLUTE_MAX_TIMEOUT` | 86400000 | Maximum timeout (24h) |
 

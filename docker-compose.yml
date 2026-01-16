@@ -41,7 +41,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: docker-agent-mcp:latest
+    image: pinocchio:latest
     depends_on:
       docker-proxy:
         condition: service_healthy
@@ -51,7 +51,7 @@ services:
       # Mount workspace root so MCP can verify paths exist (default: user's home)
       - ${PROJECTS_ROOT}:${PROJECTS_ROOT}:ro
       # Persistent config (workspace allowlist, etc.)
-      - ${HOST_CONFIG_DIR:-~/.config/docker-agent-mcp}:/root/.config/docker-agent-mcp:rw
+      - ${HOST_CONFIG_DIR:-~/.config/pinocchio}:/root/.config/pinocchio:rw
       # GitHub CLI config (for gh commands in agents)
       - ${HOST_GH_CONFIG:-~/.config/gh}:/root/.config/gh:ro
     networks:

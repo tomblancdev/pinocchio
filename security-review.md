@@ -1,4 +1,4 @@
-# Security Review: docker-agent-mcp
+# Security Review: pinocchio
 
 **Last Updated:** 2026-01-16
 **Version:** 1.0.0
@@ -8,7 +8,7 @@
 
 ## Executive Summary
 
-The docker-agent-mcp project provides an MCP server that spawns isolated Claude Code agents in Docker containers. This security review documents the implemented security controls and remaining considerations.
+The pinocchio project provides an MCP server that spawns isolated Claude Code agents in Docker containers. This security review documents the implemented security controls and remaining considerations.
 
 **Security Posture:** The system implements defense-in-depth with multiple security layers including Docker socket proxying, workspace allowlisting, read-only defaults, input validation, and configurable timeouts.
 
@@ -94,7 +94,7 @@ async function isWorkspaceAllowed(workspacePath: string) {
 
 **Remaining Considerations:**
 - Symlinks within allowed workspaces could point outside
-- Config file at `~/.config/docker-agent-mcp/config.json` should be protected
+- Config file at `~/.config/pinocchio/config.json` should be protected
 
 ---
 
@@ -302,7 +302,7 @@ github.show          // View configuration
 
 **Implementation Details:**
 - Single `manage_config` tool for all configuration
-- Persistent storage at `~/.config/docker-agent-mcp/config.json`
+- Persistent storage at `~/.config/pinocchio/config.json`
 - Implemented in `src/index.ts:262-313, 905-1119`
 
 **Configuration Sections:**
@@ -408,7 +408,7 @@ cp "$CREDS_DIR/.credentials.json" "$CLAUDE_DIR/"
 │  └─────────────────────────────└──────────────────────────────┘│
 │                                                                  │
 │  ┌─────────────────────────────────────────────────────────────┐│
-│  │  Config: ~/.config/docker-agent-mcp/config.json              ││
+│  │  Config: ~/.config/pinocchio/config.json              ││
 │  │  - allowedWorkspaces[]                                       ││
 │  │  - blockedPaths[]                                            ││
 │  │  - github.token (optional)                                   ││

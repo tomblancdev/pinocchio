@@ -28,4 +28,4 @@ Thumbs.db
 # bun.lockb
 
 # Local config with secrets
-# Note: config.json in ~/.config/docker-agent-mcp/ contains secrets, never commit that
+# Note: config.json in ~/.config/pinocchio/ contains secrets, never commit that

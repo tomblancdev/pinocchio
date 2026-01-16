@@ -1,5 +1,5 @@
 # MCP Server Dockerfile
-# Builds and runs the docker-agent MCP server
+# Builds and runs the Pinocchio MCP server
 
 FROM node:20-slim
 

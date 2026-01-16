@@ -20,8 +20,8 @@ export PROJECTS_ROOT="${PROJECTS_ROOT:-$HOME}"
 # Claude credentials location (usually ~/.claude)
 export HOST_CLAUDE_DIR="${HOST_CLAUDE_DIR:-$HOME/.claude}"
 
-# Config directory for docker-agent-mcp
-export HOST_CONFIG_DIR="${HOST_CONFIG_DIR:-$HOME/.config/docker-agent-mcp}"
+# Config directory for Pinocchio
+export HOST_CONFIG_DIR="${HOST_CONFIG_DIR:-$HOME/.config/pinocchio}"
 
 # GitHub CLI config directory
 export HOST_GH_CONFIG="${HOST_GH_CONFIG:-$HOME/.config/gh}"

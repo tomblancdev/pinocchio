@@ -29,7 +29,7 @@ export HOST_GID=$(id -g)
 export HOST_HOME="$HOME"
 export PROJECTS_ROOT="${PROJECTS_ROOT:-$HOME}"
 export HOST_CLAUDE_DIR="${HOST_CLAUDE_DIR:-$HOME/.claude}"
-export HOST_CONFIG_DIR="${HOST_CONFIG_DIR:-$HOME/.config/docker-agent-mcp}"
+export HOST_CONFIG_DIR="${HOST_CONFIG_DIR:-$HOME/.config/pinocchio}"
 
 echo "✅ Docker GID: $DOCKER_GID"
 echo "✅ User: $HOST_UID:$HOST_GID"
@@ -81,7 +81,7 @@ echo "1. Add the MCP server to your Claude Code config:"
 echo ""
 echo "   Add to ~/.claude/settings.json (or project .mcp.json):"
 echo ""
-echo '   "docker-agent": {'
+echo '   "pinocchio": {'
 echo "     \"command\": \"$SCRIPT_DIR/run-mcp.sh\""
 echo '   }'
 echo ""

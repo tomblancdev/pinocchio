@@ -15,7 +15,7 @@ import * as fs from "fs/promises";
 import { glob } from "glob";
 
 // Config file path
-const CONFIG_FILE = path.join(os.homedir(), ".config", "docker-agent-mcp", "config.json");
+const CONFIG_FILE = path.join(os.homedir(), ".config", "pinocchio", "config.json");
 
 // Config file structure
 interface AgentConfig {
@@ -261,7 +261,7 @@ Use this to check on background agents or get detailed results.`,
   },
   {
     name: "manage_config",
-    description: `Manage docker-agent configuration (workspaces, GitHub, settings).
+    description: `Manage Pinocchio configuration (workspaces, GitHub, settings).
 
 **Sections:**
 - workspaces: Manage allowed workspace paths
@@ -316,7 +316,7 @@ Use this to check on background agents or get detailed results.`,
 // Create MCP server
 const server = new Server(
   {
-    name: "docker-agent-mcp",
+    name: "pinocchio",
     version: "1.0.0",
   },
   {
@@ -532,14 +532,14 @@ async function spawnDockerAgent(args: {
     const hasWritablePaths = resolvedWritablePaths.length > 0;
     const accessMode = hasWritablePaths ? "read-only + specific writes" : "read-only";
 
-    console.error(`[docker-agent] Starting agent: ${agentId}`);
-    console.error(`[docker-agent] Workspace: ${workspace_path}`);
-    console.error(`[docker-agent] Access mode: ${accessMode}`);
-    console.error(`[docker-agent] Writable paths: ${resolvedWritablePaths.length > 0 ? resolvedWritablePaths.join(", ") : "(none)"}`);
-    console.error(`[docker-agent] Timeout: ${timeout_ms}ms`);
-    console.error(`[docker-agent] Docker access: ${allow_docker}`);
-    console.error(`[docker-agent] GitHub access: ${github_access}`);
-    console.error(`[docker-agent] Task: ${sanitizedTask.slice(0, 100)}...`);
+    console.error(`[pinocchio] Starting agent: ${agentId}`);
+    console.error(`[pinocchio] Workspace: ${workspace_path}`);
+    console.error(`[pinocchio] Access mode: ${accessMode}`);
+    console.error(`[pinocchio] Writable paths: ${resolvedWritablePaths.length > 0 ? resolvedWritablePaths.join(", ") : "(none)"}`);
+    console.error(`[pinocchio] Timeout: ${timeout_ms}ms`);
+    console.error(`[pinocchio] Docker access: ${allow_docker}`);
+    console.error(`[pinocchio] GitHub access: ${github_access}`);
+    console.error(`[pinocchio] Task: ${sanitizedTask.slice(0, 100)}...`);
 
     // Build environment variables
     const envVars = [
@@ -599,7 +599,7 @@ async function spawnDockerAgent(args: {
         CapAdd: ["CHOWN", "SETUID", "SETGID"],
         Privileged: false,
         ReadonlyRootfs: false,
-        NetworkMode: allow_docker ? "docker-agent-mcp_docker-proxy" : "bridge",
+        NetworkMode: allow_docker ? "pinocchio_docker-proxy" : "bridge",
       },
       WorkingDir: "/workspace",
     });
@@ -1101,7 +1101,7 @@ async function manageConfig(args: {
           `**🐙 GitHub:**\n` +
           `- Token: ${hasGhToken ? "configured" : "not set"}\n` +
           `- Default access: ${ghDefault}\n\n` +
-          `**Config file:** ~/.config/docker-agent-mcp/config.json`,
+          `**Config file:** ~/.config/pinocchio/config.json`,
       }],
     };
   }
@@ -1122,10 +1122,10 @@ async function manageConfig(args: {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("[docker-agent-mcp] Server started");
+  console.error("[pinocchio] Server started");
 }
 
 main().catch((error) => {
-  console.error("[docker-agent-mcp] Fatal error:", error);
+  console.error("[pinocchio] Fatal error:", error);
   process.exit(1);
 });
