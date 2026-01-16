@@ -49,8 +49,14 @@ async function loadConfig(): Promise<AgentConfig> {
 // Save config to file
 async function saveConfig(config: AgentConfig): Promise<void> {
   const dir = path.dirname(CONFIG_FILE);
-  await fs.mkdir(dir, { recursive: true });
-  await fs.writeFile(CONFIG_FILE, JSON.stringify(config, null, 2));
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  await fs.writeFile(CONFIG_FILE, JSON.stringify(config, null, 2), { mode: 0o600 });
+  // SECURITY FIX #2: Set restrictive permissions (600) on config file.
+  // The config may contain sensitive data like GitHub PAT tokens.
+  // Mode 0o600 = owner read/write only, no group or world access.
+  // Also ensure the directory has 0o700 permissions (owner rwx only).
+  await fs.chmod(CONFIG_FILE, 0o600);
+  await fs.chmod(dir, 0o700);
 }
 
 // Docker client
@@ -109,7 +115,18 @@ function sanitizeForEnv(value: string): string {
 }
 
 async function isWorkspaceAllowed(workspacePath: string): Promise<{ allowed: boolean; reason?: string }> {
-  const realPath = path.resolve(workspacePath);
+  // SECURITY FIX #1: Resolve symlinks before validation to prevent symlink escape attacks.
+  // An attacker could create a symlink inside an allowed workspace pointing to a blocked path.
+  // Using fs.realpath() resolves all symlinks, ensuring we validate the actual target path.
+  let realPath: string;
+  try {
+    realPath = await fs.realpath(workspacePath);
+  } catch (error) {
+    // If path doesn't exist, fall back to path.resolve() for the check
+    // (the path might be created later, so we validate the resolved form)
+    realPath = path.resolve(workspacePath);
+  }
+
   const config = await loadConfig();
 
   // Block system paths
@@ -119,11 +136,21 @@ async function isWorkspaceAllowed(workspacePath: string): Promise<{ allowed: boo
     }
   }
 
-  // Check allowlist
-  const isInAllowlist = config.allowedWorkspaces.some(allowed => {
-    const normalizedAllowed = path.resolve(allowed);
-    return realPath === normalizedAllowed || realPath.startsWith(normalizedAllowed + "/");
-  });
+  // Check allowlist - also resolve symlinks in allowlist entries for consistent comparison
+  const isInAllowlist = await (async () => {
+    for (const allowed of config.allowedWorkspaces) {
+      let normalizedAllowed: string;
+      try {
+        normalizedAllowed = await fs.realpath(allowed);
+      } catch {
+        normalizedAllowed = path.resolve(allowed);
+      }
+      if (realPath === normalizedAllowed || realPath.startsWith(normalizedAllowed + "/")) {
+        return true;
+      }
+    }
+    return false;
+  })();
 
   if (!isInAllowlist) {
     const allowedList = config.allowedWorkspaces.length > 0
@@ -377,17 +404,69 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
+// SECURITY FIX #7: Dangerous glob pattern blocklist.
+// These patterns are overly permissive and could grant write access to the entire workspace.
+const DANGEROUS_GLOB_PATTERNS = [
+  "**/*",        // Matches everything recursively
+  "**",          // Matches everything recursively
+  "**/",         // Matches all directories recursively
+  "*",           // Matches all files in root
+  ".",           // Current directory
+  "..",          // Parent directory
+  "**/../*",     // Parent traversal
+  "../*",        // Parent traversal
+  "**/..*",      // Hidden traversal patterns
+];
+
+// Validate glob pattern for security
+function validateGlobPattern(pattern: string): { valid: boolean; reason?: string } {
+  // Normalize the pattern for comparison
+  const normalized = pattern.trim();
+
+  // Check against dangerous patterns
+  for (const dangerous of DANGEROUS_GLOB_PATTERNS) {
+    if (normalized === dangerous) {
+      return { valid: false, reason: `Pattern "${pattern}" is too permissive and could grant excessive write access` };
+    }
+  }
+
+  // Check for parent directory traversal
+  if (normalized.includes("..")) {
+    return { valid: false, reason: `Pattern "${pattern}" contains parent directory traversal (..)` };
+  }
+
+  // Check if pattern starts with / (absolute path in glob context)
+  if (normalized.startsWith("/")) {
+    return { valid: false, reason: `Pattern "${pattern}" must be relative to workspace, not absolute` };
+  }
+
+  return { valid: true };
+}
+
 // Resolve glob patterns to actual file paths
 async function resolveWritablePaths(
   workspacePath: string,
   explicitPaths: string[] = [],
   patterns: string[] = []
-): Promise<string[]> {
+): Promise<{ paths: string[]; errors: string[] }> {
   const resolvedPaths = new Set<string>();
+  const errors: string[] = [];
 
   // Add explicit paths (relative to workspace)
   for (const p of explicitPaths) {
+    // Check for path traversal in explicit paths
+    if (p.includes("..")) {
+      errors.push(`Path "${p}" contains parent directory traversal (..)`);
+      continue;
+    }
     const fullPath = path.join(workspacePath, p);
+    // Ensure resolved path is still within workspace
+    const realFullPath = path.resolve(fullPath);
+    const realWorkspace = path.resolve(workspacePath);
+    if (!realFullPath.startsWith(realWorkspace + "/") && realFullPath !== realWorkspace) {
+      errors.push(`Path "${p}" resolves outside workspace`);
+      continue;
+    }
     try {
       await fs.access(fullPath);
       resolvedPaths.add(fullPath);
@@ -397,19 +476,30 @@ async function resolveWritablePaths(
     }
   }
 
-  // Resolve glob patterns
+  // SECURITY FIX #7: Validate glob patterns before resolving
   for (const pattern of patterns) {
+    const validation = validateGlobPattern(pattern);
+    if (!validation.valid) {
+      errors.push(validation.reason!);
+      continue;
+    }
+
     const matches = await glob(pattern, {
       cwd: workspacePath,
       absolute: true,
       nodir: false,
     });
     for (const match of matches) {
-      resolvedPaths.add(match);
+      // Additional check: ensure matches are within workspace
+      const realMatch = path.resolve(match);
+      const realWorkspace = path.resolve(workspacePath);
+      if (realMatch.startsWith(realWorkspace + "/") || realMatch === realWorkspace) {
+        resolvedPaths.add(match);
+      }
     }
   }
 
-  return Array.from(resolvedPaths);
+  return { paths: Array.from(resolvedPaths), errors };
 }
 
 // Format duration in human readable format
@@ -529,11 +619,23 @@ async function spawnDockerAgent(args: {
     }
 
     // Resolve writable paths from explicit paths and glob patterns
-    const resolvedWritablePaths = await resolveWritablePaths(
+    const { paths: resolvedWritablePaths, errors: pathErrors } = await resolveWritablePaths(
       workspace_path,
       writable_paths,
       writable_patterns
     );
+
+    // If there were validation errors with writable paths/patterns, report them
+    if (pathErrors.length > 0) {
+      return {
+        content: [{
+          type: "text" as const,
+          text: `## Invalid writable paths/patterns\n\n**Errors:**\n${pathErrors.map(e => `- ${e}`).join("\n")}\n\n` +
+            `Please fix the patterns and try again. Avoid overly permissive patterns like \`**/*\` or \`*\`.`,
+        }],
+        isError: true,
+      };
+    }
 
     const hasWritablePaths = resolvedWritablePaths.length > 0;
     const accessMode = hasWritablePaths ? "read-only + specific writes" : "read-only";
@@ -809,9 +911,35 @@ async function listDockerAgents() {
   };
 }
 
+// SECURITY FIX #14: Validate agent_id format to prevent injection attacks.
+// Agent IDs should match Docker container naming conventions.
+function validateAgentId(agentId: string): { valid: boolean; reason?: string } {
+  if (!agentId || typeof agentId !== "string") {
+    return { valid: false, reason: "Agent ID is required" };
+  }
+  // Agent IDs follow Docker container naming: alphanumeric, underscores, hyphens, dots
+  // Must start with alphanumeric, max 128 chars (same as validateContainerName)
+  if (!validateContainerName(agentId)) {
+    return { valid: false, reason: "Invalid agent ID format. Must be alphanumeric with hyphens/underscores only, max 128 chars." };
+  }
+  return { valid: true };
+}
+
 // Get agent status and output
 async function getAgentStatus(args: { agent_id: string; tail_lines?: number }) {
   const { agent_id, tail_lines = 100 } = args;
+
+  // SECURITY FIX #14: Validate agent_id format before use
+  const idValidation = validateAgentId(agent_id);
+  if (!idValidation.valid) {
+    return {
+      content: [{
+        type: "text" as const,
+        text: `## Invalid Agent ID\n\n**Error:** ${idValidation.reason}`,
+      }],
+      isError: true,
+    };
+  }
 
   // Check metadata first
   const metadata = agentMetadata.get(agent_id);
@@ -884,6 +1012,18 @@ async function getAgentStatus(args: { agent_id: string; tail_lines?: number }) {
 // Stop a running agent
 async function stopDockerAgent(args: { agent_id: string }) {
   const { agent_id } = args;
+
+  // SECURITY FIX #14: Validate agent_id format before use
+  const idValidation = validateAgentId(agent_id);
+  if (!idValidation.valid) {
+    return {
+      content: [{
+        type: "text" as const,
+        text: `## Invalid Agent ID\n\n**Error:** ${idValidation.reason}`,
+      }],
+      isError: true,
+    };
+  }
 
   try {
     const container = docker.getContainer(agent_id);
