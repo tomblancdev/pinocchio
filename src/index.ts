@@ -20,6 +20,11 @@ import * as crypto from "crypto";
 // to prevent exposure in `docker inspect` output
 const SECURE_TOKEN_DIR = path.join(os.tmpdir(), "pinocchio-tokens");
 
+// SECURITY FIX #8.1: Track which token files have been cleaned up to prevent double cleanup race condition.
+// Multiple code paths (foreground completion, background monitor, error handlers) can trigger cleanup.
+// Using a Set ensures each token file is only deleted once, avoiding race conditions.
+const cleanedTokenFiles = new Set<string>();
+
 // Config file path
 const CONFIG_FILE = path.join(os.homedir(), ".config", "pinocchio", "config.json");
 
@@ -253,12 +258,54 @@ async function createSecureTokenFile(agentId: string, token: string): Promise<st
 }
 
 // SECURITY FIX #8: Clean up token file after container stops
+// SECURITY FIX #8.1: Added cleanup flag to prevent double cleanup race condition.
+// Multiple code paths can trigger cleanup (foreground completion, background monitor, error handlers).
+// The cleanedTokenFiles Set ensures each file is only deleted once.
 async function cleanupTokenFile(tokenFilePath: string): Promise<void> {
+  // SECURITY FIX #8.1: Check if already cleaned up to prevent race condition
+  if (cleanedTokenFiles.has(tokenFilePath)) {
+    return;
+  }
+  cleanedTokenFiles.add(tokenFilePath);
+
   try {
     await fs.unlink(tokenFilePath);
+    console.error(`[pinocchio] Cleaned up token file: ${tokenFilePath}`);
   } catch (error) {
     // Ignore errors if file doesn't exist or already deleted
-    console.error(`[pinocchio] Warning: Could not delete token file: ${tokenFilePath}`);
+    // This can happen in race conditions or if file was manually removed
+  }
+}
+
+// SECURITY FIX #8.1: Clean up stale token files on startup.
+// If the MCP server is killed (SIGKILL) or crashes, token files may persist in /tmp/pinocchio-tokens/.
+// This function removes any leftover token files from previous sessions to prevent token leakage.
+async function cleanupStaleTokenFiles(): Promise<void> {
+  try {
+    // Check if the token directory exists
+    await fs.access(SECURE_TOKEN_DIR);
+
+    // Read all files in the directory
+    const files = await fs.readdir(SECURE_TOKEN_DIR);
+
+    if (files.length > 0) {
+      console.error(`[pinocchio] Cleaning up ${files.length} stale token file(s) from previous session`);
+
+      for (const file of files) {
+        // Only delete .token files to be safe
+        if (file.endsWith(".token")) {
+          const filePath = path.join(SECURE_TOKEN_DIR, file);
+          try {
+            await fs.unlink(filePath);
+            console.error(`[pinocchio] Removed stale token file: ${file}`);
+          } catch (unlinkError) {
+            console.error(`[pinocchio] Warning: Could not remove stale token file ${file}`);
+          }
+        }
+      }
+    }
+  } catch (error) {
+    // Directory doesn't exist or not accessible - that's fine, nothing to clean up
   }
 }
 
@@ -832,6 +879,17 @@ async function spawnDockerAgent(args: {
       // SECURITY FIX #8: Instead of passing token via env var (visible in docker inspect),
       // write it to a secure file and mount it into the container.
       // The entrypoint.sh will read the token from this file.
+      //
+      // SECURITY FIX #8.1: Note on GITHUB_TOKEN_FILE env var exposure:
+      // The GITHUB_TOKEN_FILE env var reveals that a token file exists at /run/secrets/github_token,
+      // but this is acceptable because:
+      // 1. It only reveals the file PATH, not the token VALUE
+      // 2. The file is mounted read-only with 0400 permissions inside the container
+      // 3. The host-side token file has 0400 permissions and is in a 0700 directory
+      // 4. The token file is deleted after container completion
+      // 5. Using /run/secrets/ is a Docker best practice for secrets management
+      // An attacker would need container access to read the file, at which point they
+      // could also intercept API calls, so the env var exposure is not a security concern.
       if (config.github?.token) {
         tokenFilePath = await createSecureTokenFile(agentId, config.github.token);
         // Tell the container where to find the token file
@@ -1553,6 +1611,11 @@ process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 async function main() {
   // RELIABILITY FIX #4: Load persisted agent state on startup
   await loadAgentState();
+
+  // SECURITY FIX #8.1: Clean up any stale token files from previous sessions.
+  // This handles cases where the MCP server was killed (SIGKILL) or crashed
+  // without proper cleanup, leaving token files in /tmp/pinocchio-tokens/.
+  await cleanupStaleTokenFiles();
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
