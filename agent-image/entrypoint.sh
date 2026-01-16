@@ -40,6 +40,17 @@ if [ -d "$GH_CREDS_DIR" ]; then
     export GH_CONFIG_DIR
 fi
 
+# SECURITY FIX #8: Read GitHub token from secure file instead of environment variable.
+# This prevents the token from being exposed via `docker inspect`.
+# The token file is mounted at /run/secrets/github_token (standard secrets location).
+if [ -n "$GITHUB_TOKEN_FILE" ] && [ -f "$GITHUB_TOKEN_FILE" ]; then
+    GITHUB_TOKEN=$(cat "$GITHUB_TOKEN_FILE")
+    GH_TOKEN="$GITHUB_TOKEN"
+    export GITHUB_TOKEN GH_TOKEN
+    # Unset the file path variable (it's no longer needed and reduces info leakage)
+    unset GITHUB_TOKEN_FILE
+fi
+
 # Optional: Change to specific directory if provided
 if [ -n "$AGENT_WORKDIR" ] && [ -d "$AGENT_WORKDIR" ]; then
     cd "$AGENT_WORKDIR"
