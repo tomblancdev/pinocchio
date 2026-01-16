@@ -574,7 +574,7 @@ async function spawnDockerAgent(args: {
 
     // Mount gh CLI config if GitHub access is needed and no token is set
     if (github_access !== "none" && !config.github?.token) {
-      binds.push(`${CONFIG.hostHomePath}/.config/gh:/home/agent/.config/gh:ro`);
+      binds.push(`${CONFIG.hostHomePath}/.config/gh:/tmp/gh-creds:ro`);
     }
 
     // Add writable path mounts (these overlay the read-only workspace)

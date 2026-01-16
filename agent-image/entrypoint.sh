@@ -26,6 +26,16 @@ cp "$CREDS_DIR/.credentials.json" "$CLAUDE_DIR/"
 
 export CLAUDE_CONFIG_DIR="$CLAUDE_DIR"
 
+# Set up GitHub CLI credentials if mounted
+GH_CREDS_DIR="/tmp/gh-creds"
+if [ -d "$GH_CREDS_DIR" ]; then
+    GH_CONFIG_DIR="/tmp/gh-config"
+    mkdir -p "$GH_CONFIG_DIR"
+    cp "$GH_CREDS_DIR"/* "$GH_CONFIG_DIR/" 2>/dev/null || true
+    chmod 600 "$GH_CONFIG_DIR"/* 2>/dev/null || true
+    export GH_CONFIG_DIR
+fi
+
 # Optional: Change to specific directory if provided
 if [ -n "$AGENT_WORKDIR" ] && [ -d "$AGENT_WORKDIR" ]; then
     cd "$AGENT_WORKDIR"
