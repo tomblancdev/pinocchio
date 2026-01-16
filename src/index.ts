@@ -146,7 +146,7 @@ const TOOLS = [
 
 The agent runs with full autonomy (YOLO mode) inside a secured container with:
 - Read-only access to your Claude Max credentials
-- Full network access for package installations
+- Configurable network access (disabled by default for security)
 - **Read-only workspace by default** - agent can only read files unless writable paths are specified
 - Optional Docker access via secure proxy for running tests/builds
 
@@ -181,6 +181,10 @@ The agent runs with full autonomy (YOLO mode) inside a secured container with:
         allow_docker: {
           type: "boolean",
           description: "Allow the agent to use Docker via secure proxy (for running tests, builds). Default: false",
+        },
+        allow_network: {
+          type: "boolean",
+          description: "Allow the agent to access the network (for package installations, API calls). Default: false for security. Enable if the task requires internet access.",
         },
         writable_paths: {
           type: "array",
@@ -343,6 +347,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         container_name?: string;
         timeout_ms?: number;
         allow_docker?: boolean;
+        allow_network?: boolean;
         writable_paths?: string[];
         writable_patterns?: string[];
         run_in_background?: boolean;
@@ -447,6 +452,7 @@ async function spawnDockerAgent(args: {
   container_name?: string;
   timeout_ms?: number;
   allow_docker?: boolean;
+  allow_network?: boolean;
   writable_paths?: string[];
   writable_patterns?: string[];
   run_in_background?: boolean;
@@ -456,6 +462,7 @@ async function spawnDockerAgent(args: {
     task,
     workspace_path,
     allow_docker = false,
+    allow_network = false,
     writable_paths = [],
     writable_patterns = [],
     run_in_background = false,
@@ -537,6 +544,7 @@ async function spawnDockerAgent(args: {
     console.error(`[pinocchio] Writable paths: ${resolvedWritablePaths.length > 0 ? resolvedWritablePaths.join(", ") : "(none)"}`);
     console.error(`[pinocchio] Timeout: ${timeout_ms}ms`);
     console.error(`[pinocchio] Docker access: ${allow_docker}`);
+    console.error(`[pinocchio] Network access: ${allow_network}`);
     console.error(`[pinocchio] GitHub access: ${github_access}`);
     console.error(`[pinocchio] Task: ${sanitizedTask.slice(0, 100)}...`);
 
@@ -598,7 +606,11 @@ async function spawnDockerAgent(args: {
         CapAdd: ["CHOWN", "SETUID", "SETGID"],
         Privileged: false,
         ReadonlyRootfs: false,
-        NetworkMode: allow_docker ? "pinocchio_docker-proxy" : "bridge",
+        // Network isolation: use docker-proxy network when Docker access is needed,
+        // bridge network when general network access is allowed,
+        // or "none" for fully isolated containers (most secure default).
+        NetworkMode: allow_docker ? "pinocchio_docker-proxy" : (allow_network ? "bridge" : "none"),
+        SecurityOpt: ["no-new-privileges:true"],
       },
       WorkingDir: "/workspace",
     });

@@ -45,8 +45,8 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | d
     && rm -rf /var/lib/apt/lists/*
 
 # Install pnpm and bun (popular package managers)
-RUN npm install -g pnpm && \
-    curl -fsSL https://bun.sh/install | bash
+# Use npm to install bun instead of piping remote script to bash for security
+RUN npm install -g pnpm bun
 
 # Install Claude Code CLI globally
 RUN npm install -g @anthropic-ai/claude-code
@@ -67,8 +67,8 @@ RUN chmod +x /entrypoint.sh
 USER agent
 WORKDIR /workspace
 
-# Add bun to PATH for agent user
-ENV PATH="/home/agent/.bun/bin:${PATH}"
+# Bun installed via npm is already in global node_modules bin path
+# No additional PATH modification needed
 
 # Labels for identification
 LABEL org.opencontainers.image.title="Claude Agent"

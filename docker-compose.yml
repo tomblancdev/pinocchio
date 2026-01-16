@@ -1,8 +1,11 @@
 services:
   # Docker Socket Proxy - limits Docker API access for security
+  # See: https://github.com/Tecnativa/docker-socket-proxy
   docker-proxy:
     image: tecnativa/docker-socket-proxy:latest
-    privileged: true  # Required to access Docker socket
+    # NOTE: privileged mode is NOT required in most cases.
+    # Only enable if you have AppArmor profiles blocking socket access:
+    # privileged: true
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     environment:
