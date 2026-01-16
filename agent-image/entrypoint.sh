@@ -26,6 +26,10 @@ cp "$CREDS_DIR/.credentials.json" "$CLAUDE_DIR/"
 
 export CLAUDE_CONFIG_DIR="$CLAUDE_DIR"
 
+# Set cache directory to writable location (fixes UID mismatch)
+export XDG_CACHE_HOME="/tmp/cache"
+mkdir -p "$XDG_CACHE_HOME"
+
 # Set up GitHub CLI credentials if mounted
 GH_CREDS_DIR="/tmp/gh-creds"
 if [ -d "$GH_CREDS_DIR" ]; then
