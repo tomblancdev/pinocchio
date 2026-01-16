@@ -87,30 +87,36 @@ async function saveConfig(config: AgentConfig): Promise<void> {
   await fs.chmod(dir, 0o700);
 }
 
+// AUDIT FIX #9: In-memory lock to prevent race condition during rotation
+// Multiple concurrent auditLog calls could trigger rotation simultaneously
+let rotationInProgress = false;
+
 // AUDIT FIX #9: Rotate audit log file if it exceeds MAX_AUDIT_SIZE
 // Keeps up to MAX_AUDIT_FILES rotated files (audit.jsonl.1, audit.jsonl.2, etc.)
 async function rotateAuditLogIfNeeded(): Promise<void> {
+  if (rotationInProgress) return;
+  rotationInProgress = true;
   try {
     const stats = await fs.stat(AUDIT_LOG_FILE);
     if (stats.size < MAX_AUDIT_SIZE) {
       return; // No rotation needed
     }
 
-    // Rotate existing files: .4 -> .5, .3 -> .4, .2 -> .3, .1 -> .2
+    // Delete the oldest file if it exists (to make room for rotation)
+    const oldestPath = `${AUDIT_LOG_FILE}.${MAX_AUDIT_FILES}`;
+    try {
+      await fs.unlink(oldestPath);
+    } catch {
+      // Oldest file doesn't exist, that's fine
+    }
+
+    // Rotate existing numbered files: .4 -> .5, .3 -> .4, .2 -> .3, .1 -> .2
     for (let i = MAX_AUDIT_FILES - 1; i >= 1; i--) {
-      const oldPath = i === 1 ? AUDIT_LOG_FILE : `${AUDIT_LOG_FILE}.${i}`;
+      const oldPath = `${AUDIT_LOG_FILE}.${i}`;
       const newPath = `${AUDIT_LOG_FILE}.${i + 1}`;
 
       try {
         await fs.access(oldPath);
-        // If target exists and is the oldest, remove it
-        if (i === MAX_AUDIT_FILES - 1) {
-          try {
-            await fs.unlink(newPath);
-          } catch {
-            // Target doesn't exist, that's fine
-          }
-        }
         await fs.rename(oldPath, newPath);
       } catch {
         // Source file doesn't exist, skip
@@ -130,6 +136,8 @@ async function rotateAuditLogIfNeeded(): Promise<void> {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
       console.error(`[pinocchio] Warning: Could not check audit log for rotation: ${error}`);
     }
+  } finally {
+    rotationInProgress = false;
   }
 }
 
@@ -155,6 +163,8 @@ async function auditLog(event: string, data: Record<string, unknown>, agentId?: 
     // Append to audit log file
     const line = JSON.stringify(auditEvent) + "\n";
     await fs.appendFile(AUDIT_LOG_FILE, line, { mode: 0o600 });
+    // Ensure permissions even on existing files (mode option only applies on create)
+    await fs.chmod(AUDIT_LOG_FILE, 0o600).catch(() => {});
   } catch (error) {
     // Audit logging should never break the main flow
     console.error(`[pinocchio] Warning: Could not write audit log: ${error}`);
@@ -1803,6 +1813,12 @@ async function manageConfig(args: {
 
         config.allowedWorkspaces.splice(index, 1);
         await saveConfig(config);
+
+        // AUDIT FIX #9: Log workspace removal
+        await auditLog("workspace.remove", {
+          path: realPath,
+        });
+
         return { content: [{ type: "text" as const, text: `🗑️ **Workspace removed:** ${realPath}` }] };
       }
     }
@@ -1843,6 +1859,11 @@ async function manageConfig(args: {
         config.github.token = token;
         await saveConfig(config);
 
+        // AUDIT FIX #9: Log that token was set (NOT the token value itself!)
+        await auditLog("github.set_token", {
+          token_length: token.length,
+        });
+
         return { content: [{ type: "text" as const, text: `✅ **GitHub token saved**\n\nAgents will use this token instead of gh CLI credentials.` }] };
       }
 
@@ -1863,6 +1884,11 @@ async function manageConfig(args: {
         config.github = config.github || {};
         config.github.defaultAccess = default_access;
         await saveConfig(config);
+
+        // AUDIT FIX #9: Log default access level change
+        await auditLog("github.set_default", {
+          default_access,
+        });
 
         return { content: [{ type: "text" as const, text: `✅ **Default GitHub access set to:** ${default_access}` }] };
       }
