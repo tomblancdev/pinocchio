@@ -507,7 +507,6 @@ async function spawnDockerAgent(args: {
 
   try {
     // Verify workspace path exists
-    const fs = await import("fs/promises");
     const stats = await fs.stat(workspace_path);
     if (!stats.isDirectory()) {
       throw new Error(`Workspace path is not a directory: ${workspace_path}`);
