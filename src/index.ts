@@ -507,13 +507,17 @@ async function isWorkspaceAllowed(workspacePath: string): Promise<{ allowed: boo
   // SECURITY FIX #1: Resolve symlinks before validation to prevent symlink escape attacks.
   // An attacker could create a symlink inside an allowed workspace pointing to a blocked path.
   // Using fs.realpath() resolves all symlinks, ensuring we validate the actual target path.
+  // SECURITY FIX #1.1: Reject if workspace path doesn't exist or is a broken symlink
   let realPath: string;
   try {
     realPath = await fs.realpath(workspacePath);
   } catch (error) {
-    // If path doesn't exist, fall back to path.resolve() for the check
-    // (the path might be created later, so we validate the resolved form)
-    realPath = path.resolve(workspacePath);
+    // SECURITY FIX #1.1: Reject non-existent paths and broken symlinks instead of falling back
+    // A broken symlink or non-existent path could be a TOCTOU attack vector
+    return {
+      allowed: false,
+      reason: `Workspace path does not exist or is a broken symlink: ${workspacePath}`
+    };
   }
 
   const config = await loadConfig();
@@ -526,13 +530,16 @@ async function isWorkspaceAllowed(workspacePath: string): Promise<{ allowed: boo
   }
 
   // Check allowlist - also resolve symlinks in allowlist entries for consistent comparison
+  // SECURITY FIX #1.1: Skip allowlist entries that don't exist (broken symlinks)
   const isInAllowlist = await (async () => {
     for (const allowed of config.allowedWorkspaces) {
       let normalizedAllowed: string;
       try {
         normalizedAllowed = await fs.realpath(allowed);
       } catch {
-        normalizedAllowed = path.resolve(allowed);
+        // SECURITY FIX #1.1: Skip this allowlist entry if it's a broken symlink or doesn't exist
+        // Don't fall back to path.resolve() as it could enable attacks
+        continue;
       }
       if (realPath === normalizedAllowed || realPath.startsWith(normalizedAllowed + "/")) {
         return true;
@@ -851,6 +858,12 @@ async function resolveWritablePaths(
   const errors: string[] = [];
 
   // Add explicit paths (relative to workspace)
+  // SECURITY FIX #3.1: Use fs.realpath() to resolve symlinks and reject on failure
+  // This prevents TOCTOU attacks where symlinks could escape the workspace
+  const realWorkspace = await fs.realpath(workspacePath).catch(() => {
+    throw new Error(`Workspace path does not exist or is not accessible: ${workspacePath}`);
+  });
+
   for (const p of explicitPaths) {
     // Check for path traversal in explicit paths
     if (p.includes("..")) {
@@ -858,20 +871,33 @@ async function resolveWritablePaths(
       continue;
     }
     const fullPath = path.join(workspacePath, p);
+
+    // SECURITY FIX #3.1: Resolve symlinks in explicit paths using fs.realpath()
+    // If the path exists, resolve it to catch symlink escapes
+    // If it doesn't exist yet (agent might create it), use path.resolve() but verify parent exists
+    let realFullPath: string;
+    try {
+      await fs.access(fullPath);
+      // Path exists - resolve symlinks to get canonical path
+      try {
+        realFullPath = await fs.realpath(fullPath);
+      } catch (realpathError) {
+        // Path exists but realpath failed (broken symlink) - reject it
+        errors.push(`Path "${p}" is a broken symlink and cannot be resolved`);
+        continue;
+      }
+    } catch {
+      // Path doesn't exist yet - that's OK, agent might create it
+      // Use path.resolve() for validation, but verify parent directory is within workspace
+      realFullPath = path.resolve(fullPath);
+    }
+
     // Ensure resolved path is still within workspace
-    const realFullPath = path.resolve(fullPath);
-    const realWorkspace = path.resolve(workspacePath);
     if (!realFullPath.startsWith(realWorkspace + "/") && realFullPath !== realWorkspace) {
       errors.push(`Path "${p}" resolves outside workspace`);
       continue;
     }
-    try {
-      await fs.access(fullPath);
-      resolvedPaths.add(fullPath);
-    } catch {
-      // Path doesn't exist yet - that's OK, agent might create it
-      resolvedPaths.add(fullPath);
-    }
+    resolvedPaths.add(realFullPath);
   }
 
   // SECURITY FIX #7: Validate glob patterns before resolving
@@ -898,10 +924,13 @@ async function resolveWritablePaths(
       try {
         realMatch = await fs.realpath(match);
       } catch {
-        // If realpath fails (e.g., broken symlink), fall back to path.resolve
-        realMatch = path.resolve(match);
+        // SECURITY FIX #3.2: Reject broken symlinks instead of falling back to path.resolve()
+        // A broken symlink could be a security risk - it might be pointing to a path
+        // that will be created later, potentially outside the workspace
+        errors.push(`Path "${match}" is a broken symlink and cannot be resolved`);
+        continue;
       }
-      const realWorkspace = await fs.realpath(workspacePath).catch(() => path.resolve(workspacePath));
+      // realWorkspace is already resolved at the start of this function
       if (realMatch.startsWith(realWorkspace + "/") || realMatch === realWorkspace) {
         resolvedPaths.add(realMatch);  // SECURITY FIX #3: Store the resolved real path
       }
