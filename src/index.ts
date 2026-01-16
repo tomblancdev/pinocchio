@@ -86,9 +86,83 @@ const RATE_LIMIT = {
   maxSpawnsPerMinute: Number(process.env.MAX_SPAWNS_PER_MINUTE) || 10,
 };
 
-// SECURITY FIX #5: Track spawn timestamps for rate limiting.
-// Used to enforce the spawns-per-minute limit.
-const spawnTimestamps: number[] = [];
+// SECURITY FIX #5.1: Track spawn timestamps using a circular buffer for O(1) operations.
+// Using an object with head/tail indices avoids O(n) shift() operations.
+interface SpawnRateTracker {
+  timestamps: number[];
+  head: number;  // Index of oldest timestamp
+  tail: number;  // Index of next write position
+  count: number; // Number of valid entries
+}
+
+const spawnRateTracker: SpawnRateTracker = {
+  timestamps: new Array(100).fill(0), // Pre-allocated circular buffer
+  head: 0,
+  tail: 0,
+  count: 0,
+};
+
+// SECURITY FIX #5.1: Track pending reservations to prevent race conditions.
+// When a spawn request passes the concurrent limit check, we reserve a slot
+// immediately before container creation to prevent TOCTOU races.
+const pendingReservations = new Set<string>();
+
+// Helper to add a timestamp to the circular buffer
+function recordSpawnTimestamp(timestamp: number): void {
+  spawnRateTracker.timestamps[spawnRateTracker.tail] = timestamp;
+  spawnRateTracker.tail = (spawnRateTracker.tail + 1) % spawnRateTracker.timestamps.length;
+  if (spawnRateTracker.count < spawnRateTracker.timestamps.length) {
+    spawnRateTracker.count++;
+  } else {
+    // Buffer is full, advance head
+    spawnRateTracker.head = (spawnRateTracker.head + 1) % spawnRateTracker.timestamps.length;
+  }
+}
+
+// Helper to clean old timestamps and count recent spawns
+function getRecentSpawnCount(cutoffTime: number): number {
+  let count = 0;
+  let newHead = spawnRateTracker.head;
+  let foundNewHead = false;
+
+  for (let i = 0; i < spawnRateTracker.count; i++) {
+    const idx = (spawnRateTracker.head + i) % spawnRateTracker.timestamps.length;
+    const timestamp = spawnRateTracker.timestamps[idx];
+
+    if (timestamp >= cutoffTime) {
+      if (!foundNewHead) {
+        newHead = idx;
+        foundNewHead = true;
+      }
+      count++;
+    }
+  }
+
+  // Update head to skip expired entries
+  if (foundNewHead) {
+    const skipped = (newHead - spawnRateTracker.head + spawnRateTracker.timestamps.length) % spawnRateTracker.timestamps.length;
+    spawnRateTracker.head = newHead;
+    spawnRateTracker.count -= skipped;
+  } else if (spawnRateTracker.count > 0) {
+    // All entries expired
+    spawnRateTracker.head = spawnRateTracker.tail;
+    spawnRateTracker.count = 0;
+  }
+
+  return count;
+}
+
+// Helper to get the oldest recent timestamp (for wait time calculation)
+function getOldestRecentTimestamp(cutoffTime: number): number | null {
+  for (let i = 0; i < spawnRateTracker.count; i++) {
+    const idx = (spawnRateTracker.head + i) % spawnRateTracker.timestamps.length;
+    const timestamp = spawnRateTracker.timestamps[idx];
+    if (timestamp >= cutoffTime) {
+      return timestamp;
+    }
+  }
+  return null;
+}
 
 // Configuration
 const CONFIG = {
@@ -559,43 +633,69 @@ async function spawnDockerAgent(args: {
   run_in_background?: boolean;
   github_access?: "none" | "read" | "comment" | "write" | "manage" | "admin";
 }) {
-  // SECURITY FIX #5: Check concurrent agent limit to prevent resource exhaustion.
-  // This prevents a malicious or buggy caller from spawning too many agents at once.
-  if (runningAgents.size >= RATE_LIMIT.maxConcurrentAgents) {
+  // Generate agent ID early so we can use it for reservation
+  const agentId = args.container_name || `claude-agent-${uuidv4().slice(0, 8)}`;
+
+  // Validate container name if provided
+  if (args.container_name && !validateContainerName(args.container_name)) {
     return {
       content: [{
         type: "text" as const,
-        text: `## Rate Limit Exceeded\n\n**Error:** Maximum ${RATE_LIMIT.maxConcurrentAgents} concurrent agents allowed. Currently running: ${runningAgents.size}\n\nPlease wait for existing agents to complete or stop them using \`stop_docker_agent\`.`,
+        text: `## Invalid container name\n\n**Error:** Container name must be alphanumeric with hyphens/underscores only, max 128 chars.`,
       }],
       isError: true,
     };
   }
 
-  // SECURITY FIX #5: Check spawn rate limit to prevent rapid spawning attacks.
-  // Clean old timestamps (older than 60 seconds) and check the rate.
+  // SECURITY FIX #5.1: Check concurrent agent limit with reservation to prevent race conditions.
+  // We include pending reservations in the count to prevent TOCTOU races where multiple
+  // concurrent requests could all pass the check before any container is created.
+  const totalActiveSlots = runningAgents.size + pendingReservations.size;
+  if (totalActiveSlots >= RATE_LIMIT.maxConcurrentAgents) {
+    // SECURITY FIX #5.1: Generic error message to avoid information disclosure
+    return {
+      content: [{
+        type: "text" as const,
+        text: `## Rate Limit Exceeded\n\n**Error:** Too many agents are currently active. Please wait for existing agents to complete or stop them using \`stop_docker_agent\`.`,
+      }],
+      isError: true,
+    };
+  }
+
+  // SECURITY FIX #5.1: Reserve a slot immediately to prevent race conditions.
+  // This reservation is released if container creation fails.
+  pendingReservations.add(agentId);
+
+  // SECURITY FIX #5.1: Check spawn rate limit using efficient circular buffer.
   const now = Date.now();
   const oneMinuteAgo = now - 60000;
 
-  // Remove timestamps older than 1 minute
-  while (spawnTimestamps.length > 0 && spawnTimestamps[0] < oneMinuteAgo) {
-    spawnTimestamps.shift();
-  }
+  // Get count of spawns in the last minute (also cleans up old entries)
+  const recentSpawnCount = getRecentSpawnCount(oneMinuteAgo);
 
   // Check if we've exceeded the spawns-per-minute limit
-  if (spawnTimestamps.length >= RATE_LIMIT.maxSpawnsPerMinute) {
-    const oldestTimestamp = spawnTimestamps[0];
-    const waitSeconds = Math.ceil((oldestTimestamp + 60000 - now) / 1000);
+  if (recentSpawnCount >= RATE_LIMIT.maxSpawnsPerMinute) {
+    // Release the reservation since we're rejecting
+    pendingReservations.delete(agentId);
+
+    const oldestTimestamp = getOldestRecentTimestamp(oneMinuteAgo);
+    const waitSeconds = oldestTimestamp
+      ? Math.ceil((oldestTimestamp + 60000 - now) / 1000)
+      : 60;
+
+    // SECURITY FIX #5.1: Generic error message to avoid information disclosure
     return {
       content: [{
         type: "text" as const,
-        text: `## Rate Limit Exceeded\n\n**Error:** Maximum ${RATE_LIMIT.maxSpawnsPerMinute} agent spawns per minute. Please wait ${waitSeconds} seconds before spawning another agent.`,
+        text: `## Rate Limit Exceeded\n\n**Error:** Too many agents spawned recently. Please wait ${waitSeconds} seconds before spawning another agent.`,
       }],
       isError: true,
     };
   }
 
-  // Record this spawn attempt
-  spawnTimestamps.push(now);
+  // NOTE: Spawn timestamp is NOT recorded here. It will be recorded AFTER successful
+  // container start to ensure failed attempts don't count against the rate limit.
+  // See SECURITY FIX #5.1 below where recordSpawnTimestamp() is called.
 
   const {
     task,
@@ -615,21 +715,11 @@ async function spawnDockerAgent(args: {
   const requestedTimeout = args.timeout_ms ?? CONFIG.defaultTimeout;
   const timeout_ms = Math.min(Math.max(requestedTimeout, 1000), CONFIG.absoluteMaxTimeout);
 
-  // Validate container name if provided
-  const agentId = args.container_name || `claude-agent-${uuidv4().slice(0, 8)}`;
-  if (args.container_name && !validateContainerName(args.container_name)) {
-    return {
-      content: [{
-        type: "text" as const,
-        text: `## Invalid container name\n\n**Error:** Container name must be alphanumeric with hyphens/underscores only, max 128 chars.`,
-      }],
-      isError: true,
-    };
-  }
-
   // Validate workspace path against allowlist
   const workspaceCheck = await isWorkspaceAllowed(workspace_path);
   if (!workspaceCheck.allowed) {
+    // SECURITY FIX #5.1: Release reservation on early return
+    pendingReservations.delete(agentId);
     return {
       content: [{
         type: "text" as const,
@@ -642,6 +732,8 @@ async function spawnDockerAgent(args: {
   // Sanitize task string
   const sanitizedTask = sanitizeForEnv(task);
   if (sanitizedTask.length === 0) {
+    // SECURITY FIX #5.1: Release reservation on early return
+    pendingReservations.delete(agentId);
     return {
       content: [{
         type: "text" as const,
@@ -676,6 +768,8 @@ async function spawnDockerAgent(args: {
 
     // If there were validation errors with writable paths/patterns, report them
     if (pathErrors.length > 0) {
+      // SECURITY FIX #5.1: Release reservation on early return
+      pendingReservations.delete(agentId);
       return {
         content: [{
           type: "text" as const,
@@ -783,6 +877,13 @@ async function spawnDockerAgent(args: {
     // Start the container
     await container.start();
 
+    // SECURITY FIX #5.1: Record spawn timestamp ONLY after successful container start.
+    // This ensures failed attempts don't count against the rate limit.
+    recordSpawnTimestamp(Date.now());
+
+    // SECURITY FIX #5.1: Release the reservation now that the agent is tracked in runningAgents.
+    pendingReservations.delete(agentId);
+
     // If background mode, return immediately
     if (run_in_background) {
       // Start background monitoring
@@ -854,6 +955,10 @@ async function spawnDockerAgent(args: {
       }],
     };
   } catch (error) {
+    // SECURITY FIX #5.1: Release reservation on error (it may not have been released yet
+    // if the error occurred before container.start() succeeded).
+    pendingReservations.delete(agentId);
+
     // Clean up on error
     runningAgents.delete(agentId);
     const metadata = agentMetadata.get(agentId);
