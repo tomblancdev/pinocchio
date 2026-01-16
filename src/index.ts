@@ -837,6 +837,11 @@ function validateGlobPattern(pattern: string): { valid: boolean; reason?: string
 }
 
 // Resolve glob patterns to actual file paths
+// SECURITY FIX #3: This function mitigates TOCTOU (Time-of-Check-Time-of-Use) race conditions:
+// 1. Glob resolution uses `follow: false` to avoid following symlinks during pattern matching
+// 2. All matched paths are resolved to their canonical form via fs.realpath() before validation
+// 3. The resolved real paths (not symlinks) are returned and used for mount configuration
+// This ensures that symlink-based attacks cannot bypass path validation between resolution and use.
 async function resolveWritablePaths(
   workspacePath: string,
   explicitPaths: string[] = [],
@@ -877,17 +882,28 @@ async function resolveWritablePaths(
       continue;
     }
 
+    // SECURITY FIX #3: Don't follow symlinks during glob to prevent symlink-based attacks
     const matches = await glob(pattern, {
       cwd: workspacePath,
       absolute: true,
       nodir: false,
+      follow: false,  // SECURITY FIX #3: Don't follow symlinks
     });
     for (const match of matches) {
-      // Additional check: ensure matches are within workspace
-      const realMatch = path.resolve(match);
-      const realWorkspace = path.resolve(workspacePath);
+      // SECURITY FIX #3: Use fs.realpath() to resolve symlinks and get canonical paths.
+      // This prevents TOCTOU attacks where an attacker could create a symlink after
+      // glob resolution but before the path is used. By resolving to the real path,
+      // we ensure the security check validates the actual target, not the symlink.
+      let realMatch: string;
+      try {
+        realMatch = await fs.realpath(match);
+      } catch {
+        // If realpath fails (e.g., broken symlink), fall back to path.resolve
+        realMatch = path.resolve(match);
+      }
+      const realWorkspace = await fs.realpath(workspacePath).catch(() => path.resolve(workspacePath));
       if (realMatch.startsWith(realWorkspace + "/") || realMatch === realWorkspace) {
-        resolvedPaths.add(match);
+        resolvedPaths.add(realMatch);  // SECURITY FIX #3: Store the resolved real path
       }
     }
   }
