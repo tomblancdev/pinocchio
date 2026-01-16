@@ -1,0 +1,103 @@
+services:
+  # Docker Socket Proxy - limits Docker API access for security
+  docker-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    privileged: true  # Required to access Docker socket
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      # Container operations (needed for spawning agents)
+      - CONTAINERS=1
+      - IMAGES=1
+      - NETWORKS=1
+      # Block dangerous operations
+      - POST=1           # Allow POST requests (create containers)
+      - BUILD=0          # Block image builds via API
+      - COMMIT=0         # Block container commits
+      - CONFIGS=0
+      - DISTRIBUTION=0
+      - EXEC=0           # Block exec into containers
+      - GRPC=0
+      - NODES=0
+      - PLUGINS=0
+      - SECRETS=0
+      - SERVICES=0
+      - SESSION=0
+      - SWARM=0
+      - SYSTEM=0
+      - TASKS=0
+      - VOLUMES=0        # Block volume creation (we use bind mounts)
+    networks:
+      - docker-proxy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:2375/_ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # MCP Server - communicates with Claude Code via stdio
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: docker-agent-mcp:latest
+    depends_on:
+      docker-proxy:
+        condition: service_healthy
+    volumes:
+      # Mount Claude credentials (read-only)
+      - ${HOST_CLAUDE_DIR:-~/.claude}:/root/.claude:ro
+      # Mount workspace root so MCP can verify paths exist (default: user's home)
+      - ${PROJECTS_ROOT}:${PROJECTS_ROOT}:ro
+      # Persistent config (workspace allowlist, etc.)
+      - ${HOST_CONFIG_DIR:-~/.config/docker-agent-mcp}:/root/.config/docker-agent-mcp:rw
+      # GitHub CLI config (for gh commands in agents)
+      - ${HOST_GH_CONFIG:-~/.config/gh}:/root/.config/gh:ro
+    networks:
+      - docker-proxy
+    stdin_open: true
+    environment:
+      - HOME=/root
+      # Use Docker proxy instead of socket
+      - DOCKER_HOST=tcp://docker-proxy:2375
+      # Pass host paths for spawned agent containers
+      - HOST_HOME=${HOST_HOME}
+      - HOST_UID=${HOST_UID:-1000}
+      - HOST_GID=${HOST_GID:-1000}
+
+  # Build the Claude agent image
+  agent-image:
+    build:
+      context: ./agent-image
+      dockerfile: Dockerfile
+    image: claude-agent:latest
+
+  # Example: Run an agent manually (for testing)
+  # docker compose run --rm agent-test
+  agent-test:
+    image: claude-agent:latest
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    environment:
+      - AGENT_TASK=List the files in the current directory and describe what you see.
+      - HOME=/home/agent
+      - DOCKER_HOST=tcp://docker-proxy:2375
+    volumes:
+      - ./:/workspace:rw
+      - ${HOST_CLAUDE_DIR:-~/.claude}:/tmp/claude-creds:ro
+    networks:
+      - docker-proxy
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 4g
+    cpus: 2
+
+networks:
+  docker-proxy:
+    driver: bridge

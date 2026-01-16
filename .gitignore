@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment files (contain secrets)
+.env
+.env.local
+.env.*.local
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Package manager locks (optional - uncomment if you want to commit)
+# package-lock.json
+# bun.lockb
+
+# Local config with secrets
+# Note: config.json in ~/.config/docker-agent-mcp/ contains secrets, never commit that

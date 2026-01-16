@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "docker-agent": {
+      "command": "/home/unloved/sandbox/docker-agent-mcp/run-mcp.sh"
+    }
+  }
+}
