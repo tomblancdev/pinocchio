@@ -17,6 +17,10 @@ import { glob } from "glob";
 // Config file path
 const CONFIG_FILE = path.join(os.homedir(), ".config", "pinocchio", "config.json");
 
+// RELIABILITY FIX #4: Persistent agent state file path
+// Agent metadata is now persisted to disk so it survives MCP server restarts
+const AGENTS_STATE_FILE = path.join(os.homedir(), ".config", "pinocchio", "agents.json");
+
 // Config file structure
 interface AgentConfig {
   allowedWorkspaces: string[];
@@ -57,6 +61,105 @@ async function saveConfig(config: AgentConfig): Promise<void> {
   // Also ensure the directory has 0o700 permissions (owner rwx only).
   await fs.chmod(CONFIG_FILE, 0o600);
   await fs.chmod(dir, 0o700);
+}
+
+// RELIABILITY FIX #4: Serializable agent metadata for persistence
+// Dates are stored as ISO strings for JSON compatibility
+interface PersistedAgentMetadata {
+  id: string;
+  task: string;
+  workspacePath: string;
+  writablePaths: string[];
+  startedAt: string;  // ISO date string
+  status: "running" | "completed" | "failed";
+  exitCode?: number;
+  endedAt?: string;   // ISO date string
+  output?: string;
+}
+
+// RELIABILITY FIX #4: Load agent state from disk on startup
+// This restores agent metadata so status can be retrieved after MCP server restarts
+async function loadAgentState(): Promise<void> {
+  try {
+    const data = await fs.readFile(AGENTS_STATE_FILE, "utf-8");
+    const persisted: PersistedAgentMetadata[] = JSON.parse(data);
+
+    const now = new Date();
+    const maxAge = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
+
+    for (const item of persisted) {
+      const startedAt = new Date(item.startedAt);
+      const endedAt = item.endedAt ? new Date(item.endedAt) : undefined;
+
+      // RELIABILITY FIX #4: Clean up old metadata (older than 24 hours)
+      // This prevents the state file from growing indefinitely
+      const referenceTime = endedAt || startedAt;
+      if (now.getTime() - referenceTime.getTime() > maxAge) {
+        console.error(`[pinocchio] Cleaning up old agent metadata: ${item.id}`);
+        continue;
+      }
+
+      // Restore metadata with Date objects
+      const metadata: AgentMetadata = {
+        id: item.id,
+        task: item.task,
+        workspacePath: item.workspacePath,
+        writablePaths: item.writablePaths,
+        startedAt,
+        status: item.status,
+        exitCode: item.exitCode,
+        endedAt,
+        output: item.output,
+      };
+
+      // If agent was marked as running but server restarted, mark as failed
+      if (metadata.status === "running") {
+        metadata.status = "failed";
+        metadata.endedAt = now;
+        metadata.output = (metadata.output || "") + "\n[pinocchio] Agent marked as failed due to MCP server restart";
+        console.error(`[pinocchio] Marking orphaned running agent as failed: ${item.id}`);
+      }
+
+      agentMetadata.set(item.id, metadata);
+    }
+
+    console.error(`[pinocchio] Loaded ${agentMetadata.size} agent(s) from state file`);
+  } catch (error) {
+    // File doesn't exist or is invalid - start fresh
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.error(`[pinocchio] Warning: Could not load agent state: ${error}`);
+    }
+  }
+}
+
+// RELIABILITY FIX #4: Save agent state to disk
+// Called when agent metadata changes (start, complete, fail)
+async function saveAgentState(): Promise<void> {
+  try {
+    const dir = path.dirname(AGENTS_STATE_FILE);
+    await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+
+    // Convert Map to array with dates as ISO strings
+    const persisted: PersistedAgentMetadata[] = [];
+    for (const [, metadata] of agentMetadata) {
+      persisted.push({
+        id: metadata.id,
+        task: metadata.task,
+        workspacePath: metadata.workspacePath,
+        writablePaths: metadata.writablePaths,
+        startedAt: metadata.startedAt.toISOString(),
+        status: metadata.status,
+        exitCode: metadata.exitCode,
+        endedAt: metadata.endedAt?.toISOString(),
+        output: metadata.output,
+      });
+    }
+
+    await fs.writeFile(AGENTS_STATE_FILE, JSON.stringify(persisted, null, 2), { mode: 0o600 });
+    await fs.chmod(AGENTS_STATE_FILE, 0o600);
+  } catch (error) {
+    console.error(`[pinocchio] Warning: Could not save agent state: ${error}`);
+  }
 }
 
 // Docker client
@@ -731,6 +834,9 @@ async function spawnDockerAgent(args: {
     };
     agentMetadata.set(agentId, metadata);
 
+    // RELIABILITY FIX #4: Persist state when agent starts
+    await saveAgentState();
+
     // Start the container
     await container.start();
 
@@ -775,6 +881,9 @@ async function spawnDockerAgent(args: {
     metadata.endedAt = endTime;
     metadata.output = output;
 
+    // RELIABILITY FIX #4: Persist state when agent completes
+    await saveAgentState();
+
     // Clean up container (keep metadata for status queries)
     try {
       await container.remove({ force: true });
@@ -811,6 +920,8 @@ async function spawnDockerAgent(args: {
     if (metadata) {
       metadata.status = "failed";
       metadata.endedAt = new Date();
+      // RELIABILITY FIX #4: Persist state when agent fails
+      await saveAgentState();
     }
 
     const errorMessage = error instanceof Error ? error.message : String(error);
@@ -838,6 +949,9 @@ async function monitorAgent(agentId: string, container: Docker.Container, timeou
       // Get and store output
       const logs = await container.logs({ stdout: true, stderr: true, follow: false });
       metadata.output = logs.toString("utf-8");
+
+      // RELIABILITY FIX #4: Persist state when background agent completes
+      await saveAgentState();
     }
 
     // Clean up container
@@ -853,6 +967,8 @@ async function monitorAgent(agentId: string, container: Docker.Container, timeou
       metadata.status = "failed";
       metadata.endedAt = new Date();
       metadata.output = `Error: ${error instanceof Error ? error.message : String(error)}`;
+      // RELIABILITY FIX #4: Persist state when background agent fails
+      await saveAgentState();
     }
     runningAgents.delete(agentId);
   }
@@ -1030,6 +1146,15 @@ async function stopDockerAgent(args: { agent_id: string }) {
     await container.stop();
     await container.remove({ force: true });
     runningAgents.delete(agent_id);
+
+    // RELIABILITY FIX #4: Update and persist metadata when agent is manually stopped
+    const metadata = agentMetadata.get(agent_id);
+    if (metadata && metadata.status === "running") {
+      metadata.status = "failed";
+      metadata.endedAt = new Date();
+      metadata.output = (metadata.output || "") + "\n[pinocchio] Agent manually stopped by user";
+      await saveAgentState();
+    }
 
     return {
       content: [
@@ -1269,8 +1394,71 @@ async function manageConfig(args: {
   };
 }
 
+// RELIABILITY FIX #16: Track if shutdown is in progress to prevent multiple shutdown attempts
+let isShuttingDown = false;
+
+// RELIABILITY FIX #16: Graceful shutdown handler
+// Stops all running agent containers and saves final state before exiting
+async function gracefulShutdown(signal: string): Promise<void> {
+  if (isShuttingDown) {
+    console.error(`[pinocchio] Shutdown already in progress, ignoring ${signal}`);
+    return;
+  }
+  isShuttingDown = true;
+
+  console.error(`[pinocchio] Received ${signal}, shutting down gracefully...`);
+
+  // Stop all running agent containers
+  const stopPromises: Promise<void>[] = [];
+  for (const [agentId, container] of runningAgents) {
+    console.error(`[pinocchio] Stopping agent container: ${agentId}`);
+    stopPromises.push(
+      (async () => {
+        try {
+          await container.stop({ t: 10 }); // 10 second timeout for graceful stop
+          console.error(`[pinocchio] Stopped container: ${agentId}`);
+        } catch (error) {
+          // Container might already be stopped
+          console.error(`[pinocchio] Could not stop container ${agentId}: ${error}`);
+        }
+
+        // Update metadata to mark as failed due to shutdown
+        const metadata = agentMetadata.get(agentId);
+        if (metadata && metadata.status === "running") {
+          metadata.status = "failed";
+          metadata.endedAt = new Date();
+          metadata.output = (metadata.output || "") + "\n[pinocchio] Agent stopped due to MCP server shutdown";
+        }
+      })()
+    );
+  }
+
+  // Wait for all containers to stop (with overall timeout)
+  if (stopPromises.length > 0) {
+    console.error(`[pinocchio] Waiting for ${stopPromises.length} container(s) to stop...`);
+    await Promise.race([
+      Promise.all(stopPromises),
+      new Promise(resolve => setTimeout(resolve, 15000)) // 15 second overall timeout
+    ]);
+  }
+
+  // Save final state
+  console.error("[pinocchio] Saving final agent state...");
+  await saveAgentState();
+
+  console.error("[pinocchio] Shutdown complete");
+  process.exit(0);
+}
+
+// RELIABILITY FIX #16: Register signal handlers for graceful shutdown
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+
 // Start the server
 async function main() {
+  // RELIABILITY FIX #4: Load persisted agent state on startup
+  await loadAgentState();
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("[pinocchio] Server started");
