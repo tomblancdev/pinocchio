@@ -28,6 +28,11 @@ const cleanedTokenFiles = new Set<string>();
 // Config file path
 const CONFIG_FILE = path.join(os.homedir(), ".config", "pinocchio", "config.json");
 
+// AUDIT FIX #9: Audit log file path and settings
+const AUDIT_LOG_FILE = path.join(os.homedir(), ".config", "pinocchio", "audit.jsonl");
+const MAX_AUDIT_SIZE = 10 * 1024 * 1024; // 10MB
+const MAX_AUDIT_FILES = 5;
+
 // RELIABILITY FIX #4: Persistent agent state file path
 // Agent metadata is now persisted to disk so it survives MCP server restarts
 const AGENTS_STATE_FILE = path.join(os.homedir(), ".config", "pinocchio", "agents.json");
@@ -51,6 +56,14 @@ const DEFAULT_CONFIG: AgentConfig = {
   pendingApprovals: [],
 };
 
+// AUDIT FIX #9: Audit event structure
+interface AuditEvent {
+  timestamp: string;
+  event: string;
+  agentId?: string;
+  data: Record<string, unknown>;
+}
+
 // Load config from file
 async function loadConfig(): Promise<AgentConfig> {
   try {
@@ -72,6 +85,80 @@ async function saveConfig(config: AgentConfig): Promise<void> {
   // Also ensure the directory has 0o700 permissions (owner rwx only).
   await fs.chmod(CONFIG_FILE, 0o600);
   await fs.chmod(dir, 0o700);
+}
+
+// AUDIT FIX #9: Rotate audit log file if it exceeds MAX_AUDIT_SIZE
+// Keeps up to MAX_AUDIT_FILES rotated files (audit.jsonl.1, audit.jsonl.2, etc.)
+async function rotateAuditLogIfNeeded(): Promise<void> {
+  try {
+    const stats = await fs.stat(AUDIT_LOG_FILE);
+    if (stats.size < MAX_AUDIT_SIZE) {
+      return; // No rotation needed
+    }
+
+    // Rotate existing files: .4 -> .5, .3 -> .4, .2 -> .3, .1 -> .2
+    for (let i = MAX_AUDIT_FILES - 1; i >= 1; i--) {
+      const oldPath = i === 1 ? AUDIT_LOG_FILE : `${AUDIT_LOG_FILE}.${i}`;
+      const newPath = `${AUDIT_LOG_FILE}.${i + 1}`;
+
+      try {
+        await fs.access(oldPath);
+        // If target exists and is the oldest, remove it
+        if (i === MAX_AUDIT_FILES - 1) {
+          try {
+            await fs.unlink(newPath);
+          } catch {
+            // Target doesn't exist, that's fine
+          }
+        }
+        await fs.rename(oldPath, newPath);
+      } catch {
+        // Source file doesn't exist, skip
+      }
+    }
+
+    // Move current file to .1
+    try {
+      await fs.rename(AUDIT_LOG_FILE, `${AUDIT_LOG_FILE}.1`);
+    } catch {
+      // Current file doesn't exist or couldn't be moved
+    }
+
+    console.error("[pinocchio] Rotated audit log file");
+  } catch (error) {
+    // File doesn't exist yet, or other error - no rotation needed
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.error(`[pinocchio] Warning: Could not check audit log for rotation: ${error}`);
+    }
+  }
+}
+
+// AUDIT FIX #9: Append an audit event to the log file
+// Events are stored as JSONL (one JSON object per line)
+async function auditLog(event: string, data: Record<string, unknown>, agentId?: string): Promise<void> {
+  try {
+    // Ensure config directory exists
+    const dir = path.dirname(AUDIT_LOG_FILE);
+    await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+
+    // Check if rotation is needed before appending
+    await rotateAuditLogIfNeeded();
+
+    // Create the audit event
+    const auditEvent: AuditEvent = {
+      timestamp: new Date().toISOString(),
+      event,
+      ...(agentId && { agentId }),
+      data,
+    };
+
+    // Append to audit log file
+    const line = JSON.stringify(auditEvent) + "\n";
+    await fs.appendFile(AUDIT_LOG_FILE, line, { mode: 0o600 });
+  } catch (error) {
+    // Audit logging should never break the main flow
+    console.error(`[pinocchio] Warning: Could not write audit log: ${error}`);
+  }
 }
 
 // RELIABILITY FIX #4: Serializable agent metadata for persistence
@@ -584,12 +671,13 @@ Use this to check on background agents or get detailed results.`,
   },
   {
     name: "manage_config",
-    description: `Manage Pinocchio configuration (workspaces, GitHub, settings).
+    description: `Manage Pinocchio configuration (workspaces, GitHub, settings, audit).
 
 **Sections:**
 - workspaces: Manage allowed workspace paths
 - github: Configure GitHub access and credentials
 - settings: View/modify general settings
+- audit: View audit logs
 
 **Workspace Actions:**
 - workspaces.list: Show allowed workspaces and pending proposals
@@ -605,7 +693,10 @@ Use this to check on background agents or get detailed results.`,
 - github.set_default: Set default access level
 
 **Settings Actions:**
-- settings.show: Display all settings`,
+- settings.show: Display all settings
+
+**Audit Actions:**
+- audit.recent: View the last 50 audit log entries`,
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -859,6 +950,14 @@ async function spawnDockerAgent(args: {
   // concurrent requests could all pass the check before any container is created.
   const totalActiveSlots = runningAgents.size + pendingReservations.size;
   if (totalActiveSlots >= RATE_LIMIT.maxConcurrentAgents) {
+    // AUDIT FIX #9: Log concurrent rate limit event
+    await auditLog("rate_limit.concurrent", {
+      requested_agent_id: agentId,
+      current_running: runningAgents.size,
+      pending_reservations: pendingReservations.size,
+      max_concurrent: RATE_LIMIT.maxConcurrentAgents,
+    });
+
     // SECURITY FIX #5.1: Generic error message to avoid information disclosure
     return {
       content: [{
@@ -889,6 +988,14 @@ async function spawnDockerAgent(args: {
     const waitSeconds = oldestTimestamp
       ? Math.ceil((oldestTimestamp + 60000 - now) / 1000)
       : 60;
+
+    // AUDIT FIX #9: Log spawn rate limit event
+    await auditLog("rate_limit.spawn", {
+      requested_agent_id: agentId,
+      recent_spawn_count: recentSpawnCount,
+      max_spawns_per_minute: RATE_LIMIT.maxSpawnsPerMinute,
+      wait_seconds: waitSeconds,
+    });
 
     // SECURITY FIX #5.1: Generic error message to avoid information disclosure
     return {
@@ -1003,6 +1110,18 @@ async function spawnDockerAgent(args: {
     console.error(`[pinocchio] GitHub access: ${github_access}`);
     console.error(`[pinocchio] Task: ${sanitizedTask.slice(0, 100)}...`);
 
+    // AUDIT FIX #9: Log agent spawn request
+    await auditLog("agent.spawn", {
+      task: sanitizedTask.slice(0, 500), // Truncate for audit log
+      workspace: workspace_path,
+      writable_paths_count: resolvedWritablePaths.length,
+      timeout_ms,
+      allow_docker,
+      allow_network,
+      github_access,
+      run_in_background,
+    }, agentId);
+
     // Build environment variables
     const envVars = [
       `AGENT_TASK=${sanitizedTask}`,
@@ -1112,6 +1231,13 @@ async function spawnDockerAgent(args: {
     // Start the container
     await container.start();
 
+    // AUDIT FIX #9: Log agent start event with container ID
+    const containerInfo = await container.inspect();
+    await auditLog("agent.start", {
+      container_id: containerInfo.Id,
+      image: CONFIG.imageName,
+    }, agentId);
+
     // SECURITY FIX #5.1: Record spawn timestamp ONLY after successful container start.
     // This ensures failed attempts don't count against the rate limit.
     recordSpawnTimestamp(Date.now());
@@ -1159,6 +1285,21 @@ async function spawnDockerAgent(args: {
     metadata.exitCode = result.StatusCode;
     metadata.endedAt = endTime;
     metadata.output = output;
+
+    // AUDIT FIX #9: Log agent completion or failure
+    if (result.StatusCode === 0) {
+      await auditLog("agent.complete", {
+        exit_code: result.StatusCode,
+        duration_ms: duration,
+        files_modified: parsed.filesModified.length,
+      }, agentId);
+    } else {
+      await auditLog("agent.fail", {
+        exit_code: result.StatusCode,
+        duration_ms: duration,
+        error: "Non-zero exit code",
+      }, agentId);
+    }
 
     // RELIABILITY FIX #4: Persist state when agent completes
     await saveAgentState();
@@ -1219,6 +1360,13 @@ async function spawnDockerAgent(args: {
     }
 
     const errorMessage = error instanceof Error ? error.message : String(error);
+
+    // AUDIT FIX #9: Log agent failure with error message
+    await auditLog("agent.fail", {
+      error: errorMessage,
+      phase: "startup",
+    }, agentId);
+
     return {
       content: [{
         type: "text" as const,
@@ -1244,6 +1392,25 @@ async function monitorAgent(agentId: string, container: Docker.Container, timeou
       const logs = await container.logs({ stdout: true, stderr: true, follow: false });
       metadata.output = logs.toString("utf-8");
 
+      // AUDIT FIX #9: Log background agent completion or failure
+      const duration_ms = metadata.endedAt.getTime() - metadata.startedAt.getTime();
+      const parsed = parseAgentOutput(metadata.output);
+      if (result.StatusCode === 0) {
+        await auditLog("agent.complete", {
+          exit_code: result.StatusCode,
+          duration_ms,
+          files_modified: parsed.filesModified.length,
+          background: true,
+        }, agentId);
+      } else {
+        await auditLog("agent.fail", {
+          exit_code: result.StatusCode,
+          duration_ms,
+          error: "Non-zero exit code",
+          background: true,
+        }, agentId);
+      }
+
       // RELIABILITY FIX #4: Persist state when background agent completes
       await saveAgentState();
 
@@ -1266,6 +1433,15 @@ async function monitorAgent(agentId: string, container: Docker.Container, timeou
       metadata.status = "failed";
       metadata.endedAt = new Date();
       metadata.output = `Error: ${error instanceof Error ? error.message : String(error)}`;
+
+      // AUDIT FIX #9: Log background agent failure
+      const duration_ms = metadata.endedAt.getTime() - metadata.startedAt.getTime();
+      await auditLog("agent.fail", {
+        error: error instanceof Error ? error.message : String(error),
+        duration_ms,
+        background: true,
+      }, agentId);
+
       // RELIABILITY FIX #4: Persist state when background agent fails
       await saveAgentState();
 
@@ -1453,12 +1629,20 @@ async function stopDockerAgent(args: { agent_id: string }) {
 
     // RELIABILITY FIX #4: Update and persist metadata when agent is manually stopped
     const metadata = agentMetadata.get(agent_id);
+    let duration_ms: number | undefined;
     if (metadata && metadata.status === "running") {
       metadata.status = "failed";
       metadata.endedAt = new Date();
       metadata.output = (metadata.output || "") + "\n[pinocchio] Agent manually stopped by user";
+      duration_ms = metadata.endedAt.getTime() - metadata.startedAt.getTime();
       await saveAgentState();
     }
+
+    // AUDIT FIX #9: Log agent stop event
+    await auditLog("agent.stop", {
+      stopped_by: "user",
+      duration_ms,
+    }, agent_id);
 
     return {
       content: [
@@ -1543,6 +1727,12 @@ async function manageConfig(args: {
         config.pendingApprovals.push({ path: realPath, proposedAt: new Date().toISOString(), reason });
         await saveConfig(config);
 
+        // AUDIT FIX #9: Log workspace proposal
+        await auditLog("workspace.propose", {
+          path: realPath,
+          reason: reason || null,
+        });
+
         return {
           content: [{
             type: "text" as const,
@@ -1557,14 +1747,22 @@ async function manageConfig(args: {
         }
         const realPath = path.resolve(workspacePath);
         const pendingIndex = config.pendingApprovals.findIndex(p => p.path === realPath);
+        const wasPending = pendingIndex !== -1;
 
-        if (pendingIndex !== -1) {
+        if (wasPending) {
           config.pendingApprovals.splice(pendingIndex, 1);
         }
 
         if (!config.allowedWorkspaces.includes(realPath)) {
           config.allowedWorkspaces.push(realPath);
           await saveConfig(config);
+
+          // AUDIT FIX #9: Log workspace approval
+          await auditLog("workspace.approve", {
+            path: realPath,
+            was_pending: wasPending,
+          });
+
           return { content: [{ type: "text" as const, text: `✅ **Workspace approved:** ${realPath}` }] };
         }
         return { content: [{ type: "text" as const, text: `**Info:** "${realPath}" is already allowed` }] };
@@ -1583,6 +1781,12 @@ async function manageConfig(args: {
 
         config.pendingApprovals.splice(pendingIndex, 1);
         await saveConfig(config);
+
+        // AUDIT FIX #9: Log workspace rejection
+        await auditLog("workspace.reject", {
+          path: realPath,
+        });
+
         return { content: [{ type: "text" as const, text: `❌ **Proposal rejected:** ${realPath}` }] };
       }
 
@@ -1686,13 +1890,78 @@ async function manageConfig(args: {
     };
   }
 
+  // AUDIT FIX #9: Handle audit actions
+  if (section === "audit" && subaction === "recent") {
+    try {
+      const data = await fs.readFile(AUDIT_LOG_FILE, "utf-8");
+      const lines = data.trim().split("\n");
+
+      // Get last 50 entries
+      const recentLines = lines.slice(-50);
+      const events: AuditEvent[] = [];
+
+      for (const line of recentLines) {
+        if (line.trim()) {
+          try {
+            events.push(JSON.parse(line));
+          } catch {
+            // Skip malformed lines
+          }
+        }
+      }
+
+      if (events.length === 0) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: `## 📋 Audit Log\n\nNo audit events found.`,
+          }],
+        };
+      }
+
+      // Format events for display
+      const formatted = events.map(e => {
+        const agentPart = e.agentId ? ` [${e.agentId}]` : "";
+        const dataPart = Object.keys(e.data).length > 0
+          ? ` ${JSON.stringify(e.data)}`
+          : "";
+        return `${e.timestamp} ${e.event}${agentPart}${dataPart}`;
+      }).join("\n");
+
+      return {
+        content: [{
+          type: "text" as const,
+          text: `## 📋 Audit Log (last ${events.length} entries)\n\n\`\`\`\n${formatted}\n\`\`\`\n\n**Log file:** ~/.config/pinocchio/audit.jsonl`,
+        }],
+      };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return {
+          content: [{
+            type: "text" as const,
+            text: `## 📋 Audit Log\n\nNo audit log file found. Events will be logged as operations occur.`,
+          }],
+        };
+      }
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      return {
+        content: [{
+          type: "text" as const,
+          text: `## 📋 Audit Log\n\n**Error reading audit log:** ${errorMessage}`,
+        }],
+        isError: true,
+      };
+    }
+  }
+
   return {
     content: [{
       type: "text" as const,
       text: `**Error:** Unknown action "${action}"\n\nValid actions:\n` +
         `- workspaces.list, workspaces.propose, workspaces.approve, workspaces.reject, workspaces.remove\n` +
         `- github.show, github.set_token, github.remove_token, github.set_default\n` +
-        `- settings.show`,
+        `- settings.show\n` +
+        `- audit.recent`,
     }],
     isError: true,
   };
