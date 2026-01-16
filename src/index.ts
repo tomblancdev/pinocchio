@@ -79,6 +79,17 @@ interface AgentMetadata {
 const runningAgents = new Map<string, Docker.Container>();
 const agentMetadata = new Map<string, AgentMetadata>();
 
+// SECURITY FIX #5: Rate limiting configuration to prevent DoS attacks.
+// Limits how many agents can run concurrently and how fast they can be spawned.
+const RATE_LIMIT = {
+  maxConcurrentAgents: Number(process.env.MAX_CONCURRENT_AGENTS) || 5,
+  maxSpawnsPerMinute: Number(process.env.MAX_SPAWNS_PER_MINUTE) || 10,
+};
+
+// SECURITY FIX #5: Track spawn timestamps for rate limiting.
+// Used to enforce the spawns-per-minute limit.
+const spawnTimestamps: number[] = [];
+
 // Configuration
 const CONFIG = {
   imageName: "claude-agent:latest",
@@ -548,6 +559,44 @@ async function spawnDockerAgent(args: {
   run_in_background?: boolean;
   github_access?: "none" | "read" | "comment" | "write" | "manage" | "admin";
 }) {
+  // SECURITY FIX #5: Check concurrent agent limit to prevent resource exhaustion.
+  // This prevents a malicious or buggy caller from spawning too many agents at once.
+  if (runningAgents.size >= RATE_LIMIT.maxConcurrentAgents) {
+    return {
+      content: [{
+        type: "text" as const,
+        text: `## Rate Limit Exceeded\n\n**Error:** Maximum ${RATE_LIMIT.maxConcurrentAgents} concurrent agents allowed. Currently running: ${runningAgents.size}\n\nPlease wait for existing agents to complete or stop them using \`stop_docker_agent\`.`,
+      }],
+      isError: true,
+    };
+  }
+
+  // SECURITY FIX #5: Check spawn rate limit to prevent rapid spawning attacks.
+  // Clean old timestamps (older than 60 seconds) and check the rate.
+  const now = Date.now();
+  const oneMinuteAgo = now - 60000;
+
+  // Remove timestamps older than 1 minute
+  while (spawnTimestamps.length > 0 && spawnTimestamps[0] < oneMinuteAgo) {
+    spawnTimestamps.shift();
+  }
+
+  // Check if we've exceeded the spawns-per-minute limit
+  if (spawnTimestamps.length >= RATE_LIMIT.maxSpawnsPerMinute) {
+    const oldestTimestamp = spawnTimestamps[0];
+    const waitSeconds = Math.ceil((oldestTimestamp + 60000 - now) / 1000);
+    return {
+      content: [{
+        type: "text" as const,
+        text: `## Rate Limit Exceeded\n\n**Error:** Maximum ${RATE_LIMIT.maxSpawnsPerMinute} agent spawns per minute. Please wait ${waitSeconds} seconds before spawning another agent.`,
+      }],
+      isError: true,
+    };
+  }
+
+  // Record this spawn attempt
+  spawnTimestamps.push(now);
+
   const {
     task,
     workspace_path,
