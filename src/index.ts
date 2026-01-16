@@ -79,10 +79,27 @@ interface PersistedAgentMetadata {
 
 // RELIABILITY FIX #4: Load agent state from disk on startup
 // This restores agent metadata so status can be retrieved after MCP server restarts
+// RELIABILITY FIX #4.1: Back up corrupted files for debugging before starting fresh
 async function loadAgentState(): Promise<void> {
   try {
     const data = await fs.readFile(AGENTS_STATE_FILE, "utf-8");
-    const persisted: PersistedAgentMetadata[] = JSON.parse(data);
+    let persisted: PersistedAgentMetadata[];
+
+    try {
+      persisted = JSON.parse(data);
+    } catch (parseError) {
+      // RELIABILITY FIX #4.1: JSON parse failed - back up corrupted file for debugging
+      const backupFile = `${AGENTS_STATE_FILE}.corrupted.${Date.now()}`;
+      console.error(`[pinocchio] State file corrupted, backing up to: ${backupFile}`);
+      try {
+        await fs.copyFile(AGENTS_STATE_FILE, backupFile);
+        await fs.chmod(backupFile, 0o600);
+      } catch (backupError) {
+        console.error(`[pinocchio] Warning: Could not create backup: ${backupError}`);
+      }
+      console.error(`[pinocchio] Starting with fresh state due to parse error: ${parseError}`);
+      return;
+    }
 
     const now = new Date();
     const maxAge = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
@@ -134,6 +151,7 @@ async function loadAgentState(): Promise<void> {
 
 // RELIABILITY FIX #4: Save agent state to disk
 // Called when agent metadata changes (start, complete, fail)
+// RELIABILITY FIX #4.1: Use atomic write pattern (temp file + rename) to prevent corruption
 async function saveAgentState(): Promise<void> {
   try {
     const dir = path.dirname(AGENTS_STATE_FILE);
@@ -155,8 +173,12 @@ async function saveAgentState(): Promise<void> {
       });
     }
 
-    await fs.writeFile(AGENTS_STATE_FILE, JSON.stringify(persisted, null, 2), { mode: 0o600 });
-    await fs.chmod(AGENTS_STATE_FILE, 0o600);
+    // RELIABILITY FIX #4.1: Write to temp file first, then atomic rename
+    // fs.rename is atomic on the same filesystem, preventing partial writes
+    const tempFile = `${AGENTS_STATE_FILE}.tmp.${process.pid}`;
+    await fs.writeFile(tempFile, JSON.stringify(persisted, null, 2), { mode: 0o600 });
+    await fs.chmod(tempFile, 0o600);
+    await fs.rename(tempFile, AGENTS_STATE_FILE);
   } catch (error) {
     console.error(`[pinocchio] Warning: Could not save agent state: ${error}`);
   }
@@ -1399,6 +1421,7 @@ let isShuttingDown = false;
 
 // RELIABILITY FIX #16: Graceful shutdown handler
 // Stops all running agent containers and saves final state before exiting
+// RELIABILITY FIX #16.1: Save state BEFORE attempting to stop containers to prevent race condition
 async function gracefulShutdown(signal: string): Promise<void> {
   if (isShuttingDown) {
     console.error(`[pinocchio] Shutdown already in progress, ignoring ${signal}`);
@@ -1408,43 +1431,45 @@ async function gracefulShutdown(signal: string): Promise<void> {
 
   console.error(`[pinocchio] Received ${signal}, shutting down gracefully...`);
 
-  // Stop all running agent containers
-  const stopPromises: Promise<void>[] = [];
+  // RELIABILITY FIX #16.1: Update metadata for all running agents FIRST
+  // This ensures state is captured before any timeout can fire
+  const containersToStop: Array<{ agentId: string; container: Docker.Container }> = [];
   for (const [agentId, container] of runningAgents) {
-    console.error(`[pinocchio] Stopping agent container: ${agentId}`);
-    stopPromises.push(
-      (async () => {
-        try {
-          await container.stop({ t: 10 }); // 10 second timeout for graceful stop
-          console.error(`[pinocchio] Stopped container: ${agentId}`);
-        } catch (error) {
-          // Container might already be stopped
-          console.error(`[pinocchio] Could not stop container ${agentId}: ${error}`);
-        }
+    containersToStop.push({ agentId, container });
 
-        // Update metadata to mark as failed due to shutdown
-        const metadata = agentMetadata.get(agentId);
-        if (metadata && metadata.status === "running") {
-          metadata.status = "failed";
-          metadata.endedAt = new Date();
-          metadata.output = (metadata.output || "") + "\n[pinocchio] Agent stopped due to MCP server shutdown";
-        }
-      })()
-    );
+    // Update metadata to mark as failed due to shutdown
+    const metadata = agentMetadata.get(agentId);
+    if (metadata && metadata.status === "running") {
+      metadata.status = "failed";
+      metadata.endedAt = new Date();
+      metadata.output = (metadata.output || "") + "\n[pinocchio] Agent stopped due to MCP server shutdown";
+    }
   }
 
-  // Wait for all containers to stop (with overall timeout)
-  if (stopPromises.length > 0) {
-    console.error(`[pinocchio] Waiting for ${stopPromises.length} container(s) to stop...`);
+  // RELIABILITY FIX #16.1: Save state IMMEDIATELY before stopping containers
+  // This guarantees state is persisted before any container stop timeout can interfere
+  console.error("[pinocchio] Saving agent state before stopping containers...");
+  await saveAgentState();
+
+  // Now stop all running agent containers (best effort, with timeout)
+  if (containersToStop.length > 0) {
+    console.error(`[pinocchio] Stopping ${containersToStop.length} container(s)...`);
+    const stopPromises = containersToStop.map(async ({ agentId, container }) => {
+      try {
+        await container.stop({ t: 10 }); // 10 second timeout for graceful stop
+        console.error(`[pinocchio] Stopped container: ${agentId}`);
+      } catch (error) {
+        // Container might already be stopped
+        console.error(`[pinocchio] Could not stop container ${agentId}: ${error}`);
+      }
+    });
+
+    // Wait for all containers to stop (with overall timeout)
     await Promise.race([
       Promise.all(stopPromises),
       new Promise(resolve => setTimeout(resolve, 15000)) // 15 second overall timeout
     ]);
   }
-
-  // Save final state
-  console.error("[pinocchio] Saving final agent state...");
-  await saveAgentState();
 
   console.error("[pinocchio] Shutdown complete");
   process.exit(0);
