@@ -12,9 +12,11 @@ import { timingSafeEqual } from 'crypto';
 import {
   WebSocketConfig,
   AgentEvent,
+  AgentLogEvent,
   ClientMessage,
   ServerMessage,
   ErrorCodes,
+  LogLevel,
   isClientMessage,
 } from './types.js';
 import { RingBuffer } from './buffer.js';
@@ -24,8 +26,10 @@ import { EventBus } from './events.js';
 // Client State
 // ============================================================================
 
+const ALL_LOG_LEVELS: Set<LogLevel> = new Set(['debug', 'info', 'warn', 'error']);
+
 interface ClientState {
-  subscriptions: Set<string>; // agentIds or '*' for all
+  subscriptions: Map<string, Set<LogLevel>>; // agentId -> Set of log levels (all levels if not specified)
   authenticated: boolean;
   buffer: RingBuffer<AgentEvent>;
   lastPing: number;
@@ -146,7 +150,7 @@ export class PinocchioWebSocket {
    */
   private handleConnection(ws: WebSocket, req: IncomingMessage): void {
     const state: ClientState = {
-      subscriptions: new Set(),
+      subscriptions: new Map(),
       authenticated: true, // Already authenticated via verifyClient
       buffer: new RingBuffer<AgentEvent>(this.config.bufferSize),
       lastPing: Date.now(),
@@ -201,7 +205,7 @@ export class PinocchioWebSocket {
 
     switch (message.type) {
       case 'subscribe':
-        this.handleSubscribe(ws, state, message.agentId);
+        this.handleSubscribe(ws, state, message.agentId, message.logLevels);
         break;
 
       case 'unsubscribe':
@@ -221,7 +225,8 @@ export class PinocchioWebSocket {
   private handleSubscribe(
     ws: WebSocket,
     state: ClientState,
-    agentId: string
+    agentId: string,
+    logLevels?: LogLevel[]
   ): void {
     // Check subscription policy
     if (this.config.subscriptionPolicy === 'owner-only' && agentId !== '*') {
@@ -229,13 +234,20 @@ export class PinocchioWebSocket {
       // For now, allow all subscriptions (implementation detail for later)
     }
 
-    state.subscriptions.add(agentId);
+    // Store subscription with log level filter (default to all levels)
+    const levels = new Set(logLevels || ALL_LOG_LEVELS);
+    state.subscriptions.set(agentId, levels);
     this.send(ws, { type: 'subscribed', agentId });
 
-    // Send buffered events for this agent
+    // Send buffered events for this agent (filtered by log level)
     if (agentId !== '*') {
       const bufferedEvents = this.eventBus.getBufferedEvents(agentId);
       for (const event of bufferedEvents) {
+        // Filter log events by level
+        if (event.type === 'agent.log') {
+          const logLevel = (event as AgentLogEvent).data.level;
+          if (!levels.has(logLevel)) continue;
+        }
         this.send(ws, { type: 'event', event });
       }
     }
@@ -259,16 +271,21 @@ export class PinocchioWebSocket {
   broadcast(event: AgentEvent): void {
     for (const [ws, state] of this.clients) {
       // Check if client is subscribed to this agent or '*'
-      if (
-        state.subscriptions.has(event.agentId) ||
-        state.subscriptions.has('*')
-      ) {
-        if (ws.readyState === WebSocket.OPEN) {
-          this.send(ws, { type: 'event', event });
-        } else {
-          // Buffer event for slow/disconnected clients
-          state.buffer.push(event);
-        }
+      const levels = state.subscriptions.get(event.agentId) || state.subscriptions.get('*');
+      if (!levels) continue;
+
+      // For log events, check level filter
+      if (event.type === 'agent.log') {
+        const logLevel = (event as AgentLogEvent).data.level;
+        if (!levels.has(logLevel)) continue;
+      }
+
+      // Send event
+      if (ws.readyState === WebSocket.OPEN) {
+        this.send(ws, { type: 'event', event });
+      } else {
+        // Buffer event for slow/disconnected clients
+        state.buffer.push(event);
       }
     }
   }

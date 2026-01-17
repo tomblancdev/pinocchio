@@ -102,9 +102,12 @@ export type AgentEvent =
 // Client -> Server Messages
 // ============================================================================
 
+export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+
 export interface SubscribeMessage {
   type: 'subscribe';
   agentId: string; // '*' for all agents
+  logLevels?: LogLevel[]; // Optional filter, defaults to all levels
 }
 
 export interface UnsubscribeMessage {
@@ -172,12 +175,31 @@ export const ErrorCodes = {
 // Type Guards
 // ============================================================================
 
+const VALID_LOG_LEVELS = new Set(['debug', 'info', 'warn', 'error']);
+
+function isValidLogLevels(levels: unknown): levels is LogLevel[] {
+  if (!Array.isArray(levels)) return false;
+  return levels.every(
+    (level) => typeof level === 'string' && VALID_LOG_LEVELS.has(level)
+  );
+}
+
 export function isClientMessage(data: unknown): data is ClientMessage {
   if (typeof data !== 'object' || data === null) return false;
   const msg = data as Record<string, unknown>;
   if (msg.type === 'ping') return true;
-  if (msg.type === 'subscribe' || msg.type === 'unsubscribe') {
+  if (msg.type === 'unsubscribe') {
     return typeof msg.agentId === 'string' && msg.agentId.length > 0;
+  }
+  if (msg.type === 'subscribe') {
+    if (typeof msg.agentId !== 'string' || msg.agentId.length === 0) {
+      return false;
+    }
+    // logLevels is optional, but if provided must be valid
+    if (msg.logLevels !== undefined && !isValidLogLevels(msg.logLevels)) {
+      return false;
+    }
+    return true;
   }
   return false;
 }
