@@ -127,7 +127,7 @@ Pinocchio provides real-time event streaming via WebSocket for monitoring agent 
 ws://127.0.0.1:3001
 ```
 
-Default port is `3001`, configurable via `WEBSOCKET_PORT` environment variable.
+Default port is `3001`. Configure via the config file (see Configuration below).
 
 ### Events
 
@@ -195,9 +195,41 @@ pinocchio/
 | `HOST_CONFIG_DIR` | `~/.config/pinocchio` | Pinocchio config directory |
 | `HOST_GH_CONFIG` | `~/.config/gh` | GitHub CLI config |
 | `ABSOLUTE_MAX_TIMEOUT` | 86400000 | Maximum timeout (24h) |
-| `WEBSOCKET_PORT` | 3001 | WebSocket server port |
-| `WEBSOCKET_AUTH` | `none` | Auth mode: `none` or `api-key` |
-| `WEBSOCKET_API_KEY` | - | API key when auth is `api-key` |
+
+## 📡 WebSocket Configuration
+
+WebSocket settings are configured in `~/.config/pinocchio/config.json`:
+
+```json
+{
+  "websocket": {
+    "enabled": true,
+    "port": 3001,
+    "bindAddress": "0.0.0.0",
+    "auth": "none",
+    "apiKey": "your-secret-key",
+    "subscriptionPolicy": "open",
+    "bufferSize": 1000,
+    "tls": {
+      "cert": "/path/to/cert.pem",
+      "key": "/path/to/key.pem"
+    }
+  }
+}
+```
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `enabled` | `true` | Enable/disable WebSocket server |
+| `port` | `3001` | TCP port to listen on |
+| `bindAddress` | `0.0.0.0` | Network interface to bind to |
+| `unixSocket` | - | Optional Unix socket path (alternative to TCP) |
+| `auth` | `none` | Auth mode: `none` or `api-key` |
+| `apiKey` | - | Required when auth is `api-key` |
+| `subscriptionPolicy` | `open` | Policy: `open`, `owner-only`, or `token-based` |
+| `bufferSize` | `1000` | Max events buffered per agent |
+| `tls.cert` | - | Path to TLS certificate file |
+| `tls.key` | - | Path to TLS private key file |
 
 ## 🤝 Contributing
 

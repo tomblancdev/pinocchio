@@ -195,10 +195,14 @@ Pinocchio streams real-time events via WebSocket, enabling live monitoring of ag
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| Port | `3001` | TCP port (`WEBSOCKET_PORT` env var) |
-| Bind Address | `127.0.0.1` | Localhost only by default |
+| Port | `3001` | TCP port (configured in config file) |
+| Bind Address | `0.0.0.0` | All interfaces by default |
 | Unix Socket | Optional | Alternative to TCP |
 | Auth | `none` | `none` or `api-key` |
+| Subscription Policy | `open` | `open`, `owner-only`, or `token-based` |
+| TLS | Optional | Configure with `tls.cert` and `tls.key` paths |
+
+See [README.md](./README.md#-websocket-configuration) for full configuration options.
 
 ### Connecting
 
@@ -363,6 +367,8 @@ Agent exited with error.
 | 4003 | Unauthorized |
 | 4004 | Rate limited |
 | 4005 | Subscription denied |
+| 4006 | Internal error |
+| 4007 | Connection timeout |
 
 ### Complete Example
 
