@@ -41,4 +41,5 @@ EOF
 fi
 
 # Run the MCP server container with stdio attached
-exec docker compose run --rm -T mcp-server
+# --service-ports ensures WebSocket port (3001) is published
+exec docker compose run --rm -T --service-ports mcp-server

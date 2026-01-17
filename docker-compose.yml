@@ -45,6 +45,8 @@ services:
       context: .
       dockerfile: Dockerfile
     image: pinocchio:latest
+    ports:
+      - "3001:3001"  # WebSocket server
     depends_on:
       docker-proxy:
         condition: service_healthy
@@ -68,6 +70,8 @@ services:
       - HOST_HOME=${HOST_HOME}
       - HOST_UID=${HOST_UID:-1000}
       - HOST_GID=${HOST_GID:-1000}
+      # WebSocket server port
+      - WEBSOCKET_PORT=3001
 
   # Build the Claude agent image
   agent-image:
