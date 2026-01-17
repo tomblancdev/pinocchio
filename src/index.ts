@@ -605,9 +605,12 @@ The agent runs with full autonomy (YOLO mode) inside a secured container with:
           type: "boolean",
           description: "Allow the agent to use Docker via secure proxy (for running tests, builds). Default: false",
         },
+        // Phase 1 of network security improvements (Issue #25):
+        // Network is now enabled by default because agents require access to Anthropic's API to function.
+        // Future phases will implement more granular controls (e.g., "anthropic-only" mode).
         allow_network: {
           type: "boolean",
-          description: "Allow the agent to access the network (for package installations, API calls). Default: false for security. Enable if the task requires internet access.",
+          description: "Allow the agent to access the network. Default: true (required for Anthropic API access). Set to false only for offline testing scenarios where the agent won't actually function.",
         },
         writable_paths: {
           type: "array",
@@ -1070,7 +1073,7 @@ async function spawnDockerAgent(args: {
     task,
     workspace_path,
     allow_docker = false,
-    allow_network = false,
+    allow_network = true,  // Phase 1 (Issue #25): Default to true - agents need Anthropic API access
     writable_paths = [],
     writable_patterns = [],
     run_in_background = false,
