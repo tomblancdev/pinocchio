@@ -14,6 +14,140 @@ import * as path from "path";
 import * as fs from "fs/promises";
 import { glob } from "glob";
 import * as crypto from "crypto";
+import { EventBus } from './websocket/events.js';
+import { PinocchioWebSocket } from './websocket/server.js';
+import { WebSocketConfig } from './websocket/types.js';
+import { ProgressTracker } from './websocket/progress.js';
+
+// PR #32 FIX: Docker stream demultiplexer
+// Docker multiplexed streams have an 8-byte header per message:
+// - Byte 0: stream type (1=stdout, 2=stderr)
+// - Bytes 1-3: reserved (zeros)
+// - Bytes 4-7: message size (big-endian uint32)
+// This class handles buffering incomplete chunks and iterating through multiple messages.
+interface DockerLogMessage {
+  streamType: 1 | 2; // 1=stdout, 2=stderr
+  content: string;
+}
+
+class DockerStreamDemultiplexer {
+  private buffer: Buffer = Buffer.alloc(0);
+  private static readonly HEADER_SIZE = 8;
+
+  // Process incoming chunk and return complete messages
+  processChunk(chunk: Buffer): DockerLogMessage[] {
+    // Append new chunk to buffer
+    this.buffer = Buffer.concat([this.buffer, chunk]);
+
+    const messages: DockerLogMessage[] = [];
+
+    // Process all complete messages in the buffer
+    while (this.buffer.length >= DockerStreamDemultiplexer.HEADER_SIZE) {
+      const streamType = this.buffer[0];
+
+      // Validate stream type (1=stdout, 2=stderr)
+      // If not a valid multiplexed stream, treat the entire buffer as raw content
+      if (streamType !== 1 && streamType !== 2) {
+        // Not a multiplexed stream - emit raw content and clear buffer
+        const content = this.buffer.toString('utf-8').trim();
+        if (content) {
+          messages.push({ streamType: 1, content });
+        }
+        this.buffer = Buffer.alloc(0);
+        break;
+      }
+
+      // Read message size from bytes 4-7 (big-endian uint32)
+      const messageSize = this.buffer.readUInt32BE(4);
+
+      // Validate message size (sanity check: max 10MB per message)
+      const MAX_MESSAGE_SIZE = 10 * 1024 * 1024;
+      if (messageSize > MAX_MESSAGE_SIZE) {
+        // Invalid size - likely corrupted stream, treat as raw and clear
+        console.error(`[pinocchio] Docker stream: invalid message size ${messageSize}, treating as raw`);
+        const content = this.buffer.toString('utf-8').trim();
+        if (content) {
+          messages.push({ streamType: 1, content });
+        }
+        this.buffer = Buffer.alloc(0);
+        break;
+      }
+
+      const totalMessageLength = DockerStreamDemultiplexer.HEADER_SIZE + messageSize;
+
+      // Check if we have the complete message
+      if (this.buffer.length < totalMessageLength) {
+        // Incomplete message, wait for more data
+        break;
+      }
+
+      // Extract the message content
+      const content = this.buffer.slice(
+        DockerStreamDemultiplexer.HEADER_SIZE,
+        totalMessageLength
+      ).toString('utf-8');
+
+      if (content.trim()) {
+        messages.push({
+          streamType: streamType as 1 | 2,
+          content: content.trim(),
+        });
+      }
+
+      // Remove processed message from buffer
+      this.buffer = this.buffer.slice(totalMessageLength);
+    }
+
+    return messages;
+  }
+
+  // Clear the buffer (for cleanup)
+  clear(): void {
+    this.buffer = Buffer.alloc(0);
+  }
+}
+
+// Helper function to determine log level from content and stream type
+function determineLogLevel(
+  content: string,
+  streamType: 1 | 2
+): 'debug' | 'info' | 'warn' | 'error' {
+  const lowerContent = content.toLowerCase();
+
+  // Check content for keywords
+  if (lowerContent.includes('error') || lowerContent.includes('fail') || lowerContent.includes('exception')) {
+    return 'error';
+  }
+  if (lowerContent.includes('warn')) {
+    return 'warn';
+  }
+  if (lowerContent.includes('debug') || lowerContent.includes('verbose')) {
+    return 'debug';
+  }
+
+  // Use stream type as hint: stderr defaults to warn
+  if (streamType === 2) {
+    return 'warn';
+  }
+
+  return 'info';
+}
+
+// Helper function to process Docker log messages and emit to event bus
+function emitLogMessages(
+  agentId: string,
+  messages: DockerLogMessage[],
+  eventBus: EventBus
+): void {
+  for (const msg of messages) {
+    // Split by newlines in case multiple lines come in one message
+    const lines = msg.content.split('\n').filter(line => line.trim());
+    for (const line of lines) {
+      const level = determineLogLevel(line, msg.streamType);
+      eventBus.emitLog(agentId, level, line);
+    }
+  }
+}
 
 // SECURITY FIX #8: Directory for secure token files
 // Tokens are written to files instead of passed via environment variables
@@ -47,6 +181,8 @@ interface AgentConfig {
     token?: string;           // PAT for GitHub API (preferred over gh CLI)
     defaultAccess?: "none" | "read" | "comment" | "write" | "manage" | "admin";
   };
+  // WebSocket configuration
+  websocket?: WebSocketConfig;
 }
 
 // Default config
@@ -54,6 +190,14 @@ const DEFAULT_CONFIG: AgentConfig = {
   allowedWorkspaces: [],
   blockedPaths: ["/etc", "/var", "/root", "/boot", "/sys", "/proc", "/dev"],
   pendingApprovals: [],
+  websocket: {
+    enabled: true,
+    port: 3001,
+    bindAddress: '0.0.0.0',  // Allow external connections (for container port mapping)
+    auth: 'none',
+    subscriptionPolicy: 'open',
+    bufferSize: 1000,
+  },
 };
 
 // AUDIT FIX #9: Audit event structure
@@ -313,6 +457,9 @@ interface AgentMetadata {
 // Track running agents and their metadata
 const runningAgents = new Map<string, Docker.Container>();
 const agentMetadata = new Map<string, AgentMetadata>();
+
+// WebSocket server instance (initialized in main if enabled)
+let wsServer: PinocchioWebSocket | null = null;
 
 // SECURITY FIX #5: Rate limiting configuration to prevent DoS attacks.
 // Limits how many agents can run concurrently and how fast they can be spawned.
@@ -1118,6 +1265,10 @@ async function spawnDockerAgent(args: {
   // SECURITY FIX #8: Track token file path for cleanup (declared outside try for catch block access)
   let tokenFilePath: string | null = null;
 
+  // PR #32 FIX: Variables declared at function scope for proper cleanup in catch block
+  let foregroundLogStream: NodeJS.ReadableStream | null = null;
+  let foregroundDemuxer: DockerStreamDemultiplexer | null = null;
+
   try {
     // Verify workspace path exists
     const stats = await fs.stat(workspace_path);
@@ -1296,6 +1447,11 @@ async function spawnDockerAgent(args: {
       image: CONFIG.imageName,
     }, agentId);
 
+    // Emit agent.started event via WebSocket
+    if (wsServer) {
+      EventBus.getInstance().emitStarted(agentId, sanitizedTask.slice(0, 500), workspace_path);
+    }
+
     // SECURITY FIX #5.1: Record spawn timestamp ONLY after successful container start.
     // This ensures failed attempts don't count against the rate limit.
     recordSpawnTimestamp(Date.now());
@@ -1323,12 +1479,75 @@ async function spawnDockerAgent(args: {
       };
     }
 
-    // Foreground mode: wait for completion
+    // Foreground mode: stream logs in real-time while waiting for completion
+    const eventBus = wsServer ? EventBus.getInstance() : null;
+
+    // Progress tracking for foreground mode
+    const foregroundProgressTracker = new ProgressTracker();
+    let foregroundLastEmittedProgress = 0;
+
+    // Start streaming logs in real-time (if WebSocket server is active)
+    if (eventBus) {
+      try {
+        foregroundLogStream = await container.logs({
+          follow: true,
+          stdout: true,
+          stderr: true,
+          timestamps: true,
+        }) as NodeJS.ReadableStream;
+
+        // PR #32 FIX: Use proper demultiplexer for Docker stream parsing
+        foregroundDemuxer = new DockerStreamDemultiplexer();
+
+        foregroundLogStream.on('data', (chunk: Buffer) => {
+          if (foregroundDemuxer && eventBus) {
+            const messages = foregroundDemuxer.processChunk(chunk);
+            emitLogMessages(agentId, messages, eventBus);
+
+            // Process each log line for progress tracking
+            for (const msg of messages) {
+              const lines = msg.content.split('\n').filter(line => line.trim());
+              for (const line of lines) {
+                foregroundProgressTracker.processLogLine(line);
+              }
+            }
+
+            // Emit progress event if progress changed by at least 5%
+            const currentProgress = foregroundProgressTracker.getProgress();
+            if (currentProgress - foregroundLastEmittedProgress >= 5) {
+              eventBus.emitProgress(
+                agentId,
+                currentProgress,
+                undefined,
+                foregroundProgressTracker.getFilesModified()
+              );
+              foregroundLastEmittedProgress = currentProgress;
+            }
+          }
+        });
+
+        foregroundLogStream.on('error', (err) => {
+          console.error(`[pinocchio] Foreground log stream error for ${agentId}:`, err.message);
+        });
+      } catch (logError) {
+        console.error(`[pinocchio] Could not start foreground log streaming for ${agentId}:`, logError);
+      }
+    }
+
+    // Wait for completion
     const result = await waitForContainer(container, timeout_ms);
     const endTime = new Date();
     const duration = endTime.getTime() - metadata.startedAt.getTime();
 
-    // Get logs
+    // Clean up log stream and demultiplexer
+    if (foregroundLogStream) {
+      foregroundLogStream.removeAllListeners();
+    }
+    if (foregroundDemuxer) {
+      foregroundDemuxer.clear();
+    }
+
+    // Get full logs for the final output
     const logs = await container.logs({
       stdout: true,
       stderr: true,
@@ -1351,12 +1570,27 @@ async function spawnDockerAgent(args: {
         duration_ms: duration,
         files_modified: parsed.filesModified.length,
       }, agentId);
+
+      // Emit final 100% progress event before completion
+      if (wsServer) {
+        EventBus.getInstance().emitProgress(agentId, 100, undefined, parsed.filesModified);
+      }
+
+      // Emit agent.completed event via WebSocket
+      if (wsServer) {
+        EventBus.getInstance().emitCompleted(agentId, result.StatusCode, duration, parsed.filesModified);
+      }
     } else {
       await auditLog("agent.fail", {
         exit_code: result.StatusCode,
         duration_ms: duration,
         error: "Non-zero exit code",
       }, agentId);
+
+      // Emit agent.failed event via WebSocket
+      if (wsServer) {
+        EventBus.getInstance().emitFailed(agentId, 'Non-zero exit code', result.StatusCode, duration);
+      }
     }
 
     // RELIABILITY FIX #4: Persist state when agent completes
@@ -1401,6 +1635,15 @@ async function spawnDockerAgent(args: {
     // if the error occurred before container.start() succeeded).
     pendingReservations.delete(agentId);
 
+    // PR #32 FIX: Clean up foreground log stream and demultiplexer on error
+    // This prevents memory leaks if waitForContainer() throws
+    if (foregroundLogStream) {
+      foregroundLogStream.removeAllListeners();
+    }
+    if (foregroundDemuxer) {
+      foregroundDemuxer.clear();
+    }
+
     // Clean up on error
     runningAgents.delete(agentId);
     const metadata = agentMetadata.get(agentId);
@@ -1425,6 +1668,11 @@ async function spawnDockerAgent(args: {
       phase: "startup",
     }, agentId);
 
+    // Emit agent.failed event via WebSocket
+    if (wsServer) {
+      EventBus.getInstance().emitFailed(agentId, errorMessage);
+    }
+
     return {
       content: [{
         type: "text" as const,
@@ -1435,47 +1683,127 @@ async function spawnDockerAgent(args: {
   }
 }
 
-// Monitor a background agent
+// Monitor a background agent with real-time log streaming
 async function monitorAgent(agentId: string, container: Docker.Container, timeout: number) {
+  const metadata = agentMetadata.get(agentId);
+  if (!metadata) return;
+
+  // Get the event bus for emitting log events (only if WebSocket server is active)
+  const eventBus = wsServer ? EventBus.getInstance() : null;
+
+  // Progress tracking: track last emitted progress to throttle events (emit only on >=5% change)
+  const progressTracker = new ProgressTracker();
+  let lastEmittedProgress = 0;
+
+  // Stream logs in real-time
+  // PR #32 FIX: Use proper demultiplexer for Docker stream parsing
+  let logStream: NodeJS.ReadableStream | null = null;
+  let demuxer: DockerStreamDemultiplexer | null = null;
+  try {
+    logStream = await container.logs({
+      follow: true,
+      stdout: true,
+      stderr: true,
+      timestamps: true,
+    }) as NodeJS.ReadableStream;
+
+    // PR #32 FIX: Use proper demultiplexer for Docker stream parsing
+    demuxer = new DockerStreamDemultiplexer();
+
+    logStream.on('data', (chunk: Buffer) => {
+      if (demuxer && eventBus) {
+        const messages = demuxer.processChunk(chunk);
+        emitLogMessages(agentId, messages, eventBus);
+
+        // Process each log line for progress tracking
+        for (const msg of messages) {
+          const lines = msg.content.split('\n').filter(line => line.trim());
+          for (const line of lines) {
+            progressTracker.processLogLine(line);
+          }
+        }
+
+        // Emit progress event if progress changed by at least 5%
+        const currentProgress = progressTracker.getProgress();
+        if (currentProgress - lastEmittedProgress >= 5) {
+          eventBus.emitProgress(
+            agentId,
+            currentProgress,
+            undefined,
+            progressTracker.getFilesModified()
+          );
+          lastEmittedProgress = currentProgress;
+        }
+      }
+    });
+
+    logStream.on('error', (err) => {
+      console.error(`[pinocchio] Log stream error for ${agentId}:`, err.message);
+    });
+  } catch (logError) {
+    // Log streaming failed but we can still monitor the container
+    console.error(`[pinocchio] Could not start log streaming for ${agentId}:`, logError);
+  }
+
   try {
     const result = await waitForContainer(container, timeout);
-    const metadata = agentMetadata.get(agentId);
 
-    if (metadata) {
-      metadata.status = result.StatusCode === 0 ? "completed" : "failed";
-      metadata.exitCode = result.StatusCode;
-      metadata.endedAt = new Date();
+    // Clean up log stream and demultiplexer (stream ends naturally when container stops, but be explicit)
+    if (logStream) {
+      logStream.removeAllListeners();
+    }
+    if (demuxer) {
+      demuxer.clear();
+    }
 
-      // Get and store output
-      const logs = await container.logs({ stdout: true, stderr: true, follow: false });
-      metadata.output = logs.toString("utf-8");
+    metadata.status = result.StatusCode === 0 ? "completed" : "failed";
+    metadata.exitCode = result.StatusCode;
+    metadata.endedAt = new Date();
 
-      // AUDIT FIX #9: Log background agent completion or failure
-      const duration_ms = metadata.endedAt.getTime() - metadata.startedAt.getTime();
-      const parsed = parseAgentOutput(metadata.output);
-      if (result.StatusCode === 0) {
-        await auditLog("agent.complete", {
-          exit_code: result.StatusCode,
-          duration_ms,
-          files_modified: parsed.filesModified.length,
-          background: true,
-        }, agentId);
-      } else {
-        await auditLog("agent.fail", {
-          exit_code: result.StatusCode,
-          duration_ms,
-          error: "Non-zero exit code",
-          background: true,
-        }, agentId);
+    // Get and store output
+    const logs = await container.logs({ stdout: true, stderr: true, follow: false });
+    metadata.output = logs.toString("utf-8");
+
+    // AUDIT FIX #9: Log background agent completion or failure
+    const duration_ms = metadata.endedAt.getTime() - metadata.startedAt.getTime();
+    const parsed = parseAgentOutput(metadata.output);
+    if (result.StatusCode === 0) {
+      await auditLog("agent.complete", {
+        exit_code: result.StatusCode,
+        duration_ms,
+        files_modified: parsed.filesModified.length,
+        background: true,
+      }, agentId);
+
+      // Emit final 100% progress event before completion
+      if (wsServer) {
+        EventBus.getInstance().emitProgress(agentId, 100, undefined, parsed.filesModified);
       }
 
-      // RELIABILITY FIX #4: Persist state when background agent completes
-      await saveAgentState();
-
-      // SECURITY FIX #8: Clean up token file after container completes
-      if (metadata.tokenFilePath) {
-        await cleanupTokenFile(metadata.tokenFilePath);
+      // Emit agent.completed event via WebSocket for background agents
+      if (wsServer) {
+        EventBus.getInstance().emitCompleted(agentId, result.StatusCode, duration_ms, parsed.filesModified);
       }
+    } else {
+      await auditLog("agent.fail", {
+        exit_code: result.StatusCode,
+        duration_ms,
+        error: "Non-zero exit code",
+        background: true,
+      }, agentId);
+
+      // Emit agent.failed event via WebSocket for background agents
+      if (wsServer) {
+        EventBus.getInstance().emitFailed(agentId, 'Non-zero exit code', result.StatusCode, duration_ms);
+      }
+    }
+
+    // RELIABILITY FIX #4: Persist state when background agent completes
+    await saveAgentState();
+
+    // SECURITY FIX #8: Clean up token file after container completes
+    if (metadata.tokenFilePath) {
+      await cleanupTokenFile(metadata.tokenFilePath);
     }
 
     // Clean up container
@@ -1486,28 +1814,40 @@ async function monitorAgent(agentId: string, container: Docker.Container, timeou
     }
     runningAgents.delete(agentId);
   } catch (error) {
-    const metadata = agentMetadata.get(agentId);
-    if (metadata) {
-      metadata.status = "failed";
-      metadata.endedAt = new Date();
-      metadata.output = `Error: ${error instanceof Error ? error.message : String(error)}`;
-
-      // AUDIT FIX #9: Log background agent failure
-      const duration_ms = metadata.endedAt.getTime() - metadata.startedAt.getTime();
-      await auditLog("agent.fail", {
-        error: error instanceof Error ? error.message : String(error),
-        duration_ms,
-        background: true,
-      }, agentId);
-
-      // RELIABILITY FIX #4: Persist state when background agent fails
-      await saveAgentState();
-
-      // SECURITY FIX #8: Clean up token file even on error
-      if (metadata.tokenFilePath) {
-        await cleanupTokenFile(metadata.tokenFilePath);
-      }
+    // Clean up log stream and demultiplexer on error
+    if (logStream) {
+      logStream.removeAllListeners();
     }
+    if (demuxer) {
+      demuxer.clear();
+    }
+
+    metadata.status = "failed";
+    metadata.endedAt = new Date();
+    metadata.output = `Error: ${error instanceof Error ? error.message : String(error)}`;
+
+    // AUDIT FIX #9: Log background agent failure
+    const duration_ms = metadata.endedAt.getTime() - metadata.startedAt.getTime();
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    await auditLog("agent.fail", {
+      error: errorMessage,
+      duration_ms,
+      background: true,
+    }, agentId);
+
+    // Emit agent.failed event via WebSocket for background agent errors
+    if (wsServer) {
+      EventBus.getInstance().emitFailed(agentId, errorMessage, undefined, duration_ms);
+    }
+
+    // RELIABILITY FIX #4: Persist state when background agent fails
+    await saveAgentState();
+
+    // SECURITY FIX #8: Clean up token file even on error
+    if (metadata.tokenFilePath) {
+      await cleanupTokenFile(metadata.tokenFilePath);
+    }
+
     runningAgents.delete(agentId);
   }
 }
@@ -2096,6 +2436,12 @@ async function gracefulShutdown(signal: string): Promise<void> {
     ]);
   }
 
+  // Close WebSocket server if running
+  if (wsServer) {
+    console.error("[pinocchio] Closing WebSocket server...");
+    await wsServer.close();
+  }
+
   console.error("[pinocchio] Shutdown complete");
   process.exit(0);
 }
@@ -2117,6 +2463,18 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("[pinocchio] Server started");
+
+  // Initialize WebSocket server if enabled
+  const config = await loadConfig();
+  if (config.websocket?.enabled) {
+    wsServer = new PinocchioWebSocket(config.websocket);
+    try {
+      wsServer.start();
+      console.error('[pinocchio] WebSocket server started on port', config.websocket.port);
+    } catch (error) {
+      console.error('[pinocchio] Failed to start WebSocket server:', error);
+    }
+  }
 }
 
 main().catch((error) => {
