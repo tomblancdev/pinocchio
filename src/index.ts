@@ -17,6 +17,7 @@ import * as crypto from "crypto";
 import { EventBus } from './websocket/events.js';
 import { PinocchioWebSocket } from './websocket/server.js';
 import { WebSocketConfig } from './websocket/types.js';
+import { ProgressTracker } from './websocket/progress.js';
 
 // PR #32 FIX: Docker stream demultiplexer
 // Docker multiplexed streams have an 8-byte header per message:
@@ -1480,6 +1481,10 @@ async function spawnDockerAgent(args: {
     let foregroundLogStream: NodeJS.ReadableStream | null = null;
     let foregroundDemuxer: DockerStreamDemultiplexer | null = null;
 
+    // Progress tracking for foreground mode
+    const foregroundProgressTracker = new ProgressTracker();
+    let foregroundLastEmittedProgress = 0;
+
     // Start streaming logs in real-time (if WebSocket server is active)
     if (eventBus) {
       try {
@@ -1497,6 +1502,27 @@ async function spawnDockerAgent(args: {
           if (foregroundDemuxer && eventBus) {
             const messages = foregroundDemuxer.processChunk(chunk);
             emitLogMessages(agentId, messages, eventBus);
+
+            // Process each log line for progress tracking
+            for (const msg of messages) {
+              const lines = msg.content.split('\n').filter(line => line.trim());
+              for (const line of lines) {
+                foregroundProgressTracker.processLogLine(line);
+              }
+            }
+
+            // Emit progress event if progress changed by at least 5%
+            const currentProgress = foregroundProgressTracker.getProgress();
+            if (currentProgress - foregroundLastEmittedProgress >= 5) {
+              const progressInfo = foregroundProgressTracker.getProgressInfo();
+              eventBus.emitProgress(
+                agentId,
+                currentProgress,
+                progressInfo.currentPhase,
+                progressInfo.filesModified
+              );
+              foregroundLastEmittedProgress = currentProgress;
+            }
           }
         });
 
@@ -1660,6 +1686,10 @@ async function monitorAgent(agentId: string, container: Docker.Container, timeou
   // Get the event bus for emitting log events (only if WebSocket server is active)
   const eventBus = wsServer ? EventBus.getInstance() : null;
 
+  // Progress tracking: track last emitted progress to throttle events (emit only on >=5% change)
+  const progressTracker = new ProgressTracker();
+  let lastEmittedProgress = 0;
+
   // Stream logs in real-time
   // PR #32 FIX: Use proper demultiplexer for Docker stream parsing
   let logStream: NodeJS.ReadableStream | null = null;
@@ -1679,6 +1709,27 @@ async function monitorAgent(agentId: string, container: Docker.Container, timeou
       if (demuxer && eventBus) {
         const messages = demuxer.processChunk(chunk);
         emitLogMessages(agentId, messages, eventBus);
+
+        // Process each log line for progress tracking
+        for (const msg of messages) {
+          const lines = msg.content.split('\n').filter(line => line.trim());
+          for (const line of lines) {
+            progressTracker.processLogLine(line);
+          }
+        }
+
+        // Emit progress event if progress changed by at least 5%
+        const currentProgress = progressTracker.getProgress();
+        if (currentProgress - lastEmittedProgress >= 5) {
+          const progressInfo = progressTracker.getProgressInfo();
+          eventBus.emitProgress(
+            agentId,
+            currentProgress,
+            progressInfo.currentPhase,
+            progressInfo.filesModified
+          );
+          lastEmittedProgress = currentProgress;
+        }
       }
     });
 
