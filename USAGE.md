@@ -9,6 +9,7 @@ This guide covers common usage patterns and examples for Pinocchio.
 - [Write Access Control](#write-access-control)
 - [Background Agents](#background-agents)
 - [GitHub Integration](#github-integration)
+- [WebSocket Events](#websocket-events)
 - [Advanced Scenarios](#advanced-scenarios)
 - [Troubleshooting](#troubleshooting)
 
@@ -183,6 +184,240 @@ Use github_access: write
 | `write` | Creating PRs, pushing branches |
 | `manage` | Scrum master tasks, milestone management |
 | `admin` | Workflow modifications, repo settings |
+
+---
+
+## WebSocket Events
+
+Pinocchio streams real-time events via WebSocket, enabling live monitoring of agent activity.
+
+### Connection Details
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| Port | `3001` | TCP port (configured in config file) |
+| Bind Address | `0.0.0.0` | All interfaces by default |
+| Unix Socket | Optional | Alternative to TCP |
+| Auth | `none` | `none` or `api-key` |
+| Subscription Policy | `open` | `open`, `owner-only`, or `token-based` |
+| TLS | Optional | Configure with `tls.cert` and `tls.key` paths |
+
+See [README.md](./README.md#-websocket-configuration) for full configuration options.
+
+### Connecting
+
+**No authentication (default):**
+
+```javascript
+const ws = new WebSocket('ws://127.0.0.1:3001');
+```
+
+**With API key:**
+
+```javascript
+const ws = new WebSocket('ws://127.0.0.1:3001', {
+  headers: { Authorization: 'Bearer your-api-key' }
+});
+```
+
+### Subscribing to Events
+
+**Subscribe to all agents:**
+
+```json
+{"type": "subscribe", "agentId": "*"}
+```
+
+**Subscribe to specific agent:**
+
+```json
+{"type": "subscribe", "agentId": "claude-agent-abc123"}
+```
+
+**Filter by log level:**
+
+```json
+{"type": "subscribe", "agentId": "*", "logLevels": ["warn", "error"]}
+```
+
+Available log levels: `debug`, `info`, `warn`, `error`
+
+**Unsubscribe:**
+
+```json
+{"type": "unsubscribe", "agentId": "*"}
+```
+
+### Event Types
+
+#### `agent.started`
+
+Emitted when an agent container launches.
+
+```json
+{
+  "type": "event",
+  "event": {
+    "type": "agent.started",
+    "agentId": "claude-agent-abc123",
+    "timestamp": "2024-01-15T10:30:00.000Z",
+    "data": {
+      "task": "Review the authentication module",
+      "workspace": "/home/user/myproject"
+    }
+  }
+}
+```
+
+#### `agent.log`
+
+Agent output with log level.
+
+```json
+{
+  "type": "event",
+  "event": {
+    "type": "agent.log",
+    "agentId": "claude-agent-abc123",
+    "timestamp": "2024-01-15T10:30:05.000Z",
+    "data": {
+      "level": "info",
+      "message": "Reading file src/auth.ts",
+      "metadata": {"file": "src/auth.ts"}
+    }
+  }
+}
+```
+
+#### `agent.progress`
+
+Task progress updates.
+
+```json
+{
+  "type": "event",
+  "event": {
+    "type": "agent.progress",
+    "agentId": "claude-agent-abc123",
+    "timestamp": "2024-01-15T10:31:00.000Z",
+    "data": {
+      "progress": 45,
+      "message": "Analyzing dependencies",
+      "filesModified": ["src/auth.ts"]
+    }
+  }
+}
+```
+
+#### `agent.completed`
+
+Agent finished successfully.
+
+```json
+{
+  "type": "event",
+  "event": {
+    "type": "agent.completed",
+    "agentId": "claude-agent-abc123",
+    "timestamp": "2024-01-15T10:35:00.000Z",
+    "data": {
+      "exitCode": 0,
+      "duration": 300000,
+      "filesModified": ["src/auth.ts", "src/utils.ts"]
+    }
+  }
+}
+```
+
+#### `agent.failed`
+
+Agent exited with error.
+
+```json
+{
+  "type": "event",
+  "event": {
+    "type": "agent.failed",
+    "agentId": "claude-agent-abc123",
+    "timestamp": "2024-01-15T10:32:00.000Z",
+    "data": {
+      "exitCode": 1,
+      "error": "Timeout exceeded",
+      "duration": 120000
+    }
+  }
+}
+```
+
+### Server Messages
+
+| Message | Description |
+|---------|-------------|
+| `{"type": "subscribed", "agentId": "..."}` | Subscription confirmed |
+| `{"type": "unsubscribed", "agentId": "..."}` | Unsubscription confirmed |
+| `{"type": "pong"}` | Response to ping |
+| `{"type": "error", "code": N, "message": "..."}` | Error occurred |
+
+### Error Codes
+
+| Code | Meaning |
+|------|---------|
+| 4001 | Invalid message format |
+| 4002 | Agent not found |
+| 4003 | Unauthorized |
+| 4004 | Rate limited |
+| 4005 | Subscription denied |
+| 4006 | Internal error |
+| 4007 | Connection timeout |
+
+### Complete Example
+
+```javascript
+const WebSocket = require('ws');
+
+const ws = new WebSocket('ws://127.0.0.1:3001');
+
+ws.on('open', () => {
+  // Subscribe to all agents, only errors and warnings
+  ws.send(JSON.stringify({
+    type: 'subscribe',
+    agentId: '*',
+    logLevels: ['warn', 'error']
+  }));
+});
+
+ws.on('message', (data) => {
+  const msg = JSON.parse(data);
+
+  if (msg.type === 'event') {
+    const { event } = msg;
+    switch (event.type) {
+      case 'agent.started':
+        console.log(`Agent ${event.agentId} started: ${event.data.task}`);
+        break;
+      case 'agent.log':
+        console.log(`[${event.data.level}] ${event.data.message}`);
+        break;
+      case 'agent.progress':
+        console.log(`Progress: ${event.data.progress}%`);
+        break;
+      case 'agent.completed':
+        console.log(`Completed in ${event.data.duration}ms`);
+        break;
+      case 'agent.failed':
+        console.error(`Failed: ${event.data.error}`);
+        break;
+    }
+  }
+});
+
+// Keep connection alive
+setInterval(() => ws.send(JSON.stringify({ type: 'ping' })), 30000);
+```
+
+### Event Buffering
+
+Late subscribers receive buffered events for agents they subscribe to. Buffer size is configurable (default: 1000 events per agent).
 
 ---
 
