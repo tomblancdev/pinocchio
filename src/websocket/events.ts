@@ -12,50 +12,7 @@ import {
   AgentCompletedEvent,
   AgentFailedEvent,
 } from './types.js';
-
-// ============================================================================
-// Event Buffer for Replay
-// ============================================================================
-
-export class EventBuffer<T> {
-  private buffer: T[] = [];
-  private head = 0;
-  private size = 0;
-
-  constructor(private capacity: number) {
-    this.buffer = new Array(capacity);
-  }
-
-  push(item: T): void {
-    const index = (this.head + this.size) % this.capacity;
-    if (this.size < this.capacity) {
-      this.buffer[index] = item;
-      this.size++;
-    } else {
-      // Buffer full, overwrite oldest
-      this.buffer[this.head] = item;
-      this.head = (this.head + 1) % this.capacity;
-    }
-  }
-
-  toArray(): T[] {
-    const result: T[] = [];
-    for (let i = 0; i < this.size; i++) {
-      result.push(this.buffer[(this.head + i) % this.capacity]);
-    }
-    return result;
-  }
-
-  clear(): void {
-    this.buffer = new Array(this.capacity);
-    this.head = 0;
-    this.size = 0;
-  }
-
-  getSize(): number {
-    return this.size;
-  }
-}
+import { RingBuffer } from './buffer.js';
 
 // ============================================================================
 // Event Bus
@@ -65,7 +22,7 @@ type AgentEventHandler = (event: AgentEvent) => void;
 
 export class EventBus extends EventEmitter {
   private static instance: EventBus | null = null;
-  private agentBuffers: Map<string, EventBuffer<AgentEvent>> = new Map();
+  private agentBuffers: Map<string, RingBuffer<AgentEvent>> = new Map();
   private bufferCapacity: number;
 
   private constructor(bufferCapacity = 1000) {
@@ -77,6 +34,8 @@ export class EventBus extends EventEmitter {
   static getInstance(bufferCapacity = 1000): EventBus {
     if (!EventBus.instance) {
       EventBus.instance = new EventBus(bufferCapacity);
+    } else if (bufferCapacity !== EventBus.instance.bufferCapacity) {
+      console.warn('[EventBus] Capacity change ignored - singleton already initialized');
     }
     return EventBus.instance;
   }
@@ -97,7 +56,7 @@ export class EventBus extends EventEmitter {
     // Store in agent-specific buffer
     let buffer = this.agentBuffers.get(event.agentId);
     if (!buffer) {
-      buffer = new EventBuffer<AgentEvent>(this.bufferCapacity);
+      buffer = new RingBuffer<AgentEvent>(this.bufferCapacity);
       this.agentBuffers.set(event.agentId, buffer);
     }
     buffer.push(event);
