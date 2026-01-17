@@ -1514,12 +1514,11 @@ async function spawnDockerAgent(args: {
             // Emit progress event if progress changed by at least 5%
             const currentProgress = foregroundProgressTracker.getProgress();
             if (currentProgress - foregroundLastEmittedProgress >= 5) {
-              const progressInfo = foregroundProgressTracker.getProgressInfo();
               eventBus.emitProgress(
                 agentId,
                 currentProgress,
-                progressInfo.currentPhase,
-                progressInfo.filesModified
+                undefined,
+                foregroundProgressTracker.getFilesModified()
               );
               foregroundLastEmittedProgress = currentProgress;
             }
@@ -1570,6 +1569,11 @@ async function spawnDockerAgent(args: {
         duration_ms: duration,
         files_modified: parsed.filesModified.length,
       }, agentId);
+
+      // Emit final 100% progress event before completion
+      if (wsServer) {
+        EventBus.getInstance().emitProgress(agentId, 100, undefined, parsed.filesModified);
+      }
 
       // Emit agent.completed event via WebSocket
       if (wsServer) {
@@ -1721,12 +1725,11 @@ async function monitorAgent(agentId: string, container: Docker.Container, timeou
         // Emit progress event if progress changed by at least 5%
         const currentProgress = progressTracker.getProgress();
         if (currentProgress - lastEmittedProgress >= 5) {
-          const progressInfo = progressTracker.getProgressInfo();
           eventBus.emitProgress(
             agentId,
             currentProgress,
-            progressInfo.currentPhase,
-            progressInfo.filesModified
+            undefined,
+            progressTracker.getFilesModified()
           );
           lastEmittedProgress = currentProgress;
         }
@@ -1770,6 +1773,11 @@ async function monitorAgent(agentId: string, container: Docker.Container, timeou
         files_modified: parsed.filesModified.length,
         background: true,
       }, agentId);
+
+      // Emit final 100% progress event before completion
+      if (wsServer) {
+        EventBus.getInstance().emitProgress(agentId, 100, undefined, parsed.filesModified);
+      }
 
       // Emit agent.completed event via WebSocket for background agents
       if (wsServer) {
