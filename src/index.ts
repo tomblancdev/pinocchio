@@ -193,7 +193,7 @@ const DEFAULT_CONFIG: AgentConfig = {
   websocket: {
     enabled: true,
     port: 3001,
-    bindAddress: '127.0.0.1',
+    bindAddress: '0.0.0.0',  // Allow external connections (for container port mapping)
     auth: 'none',
     subscriptionPolicy: 'open',
     bufferSize: 1000,
