@@ -49,7 +49,7 @@ const TOOL_PATTERNS = {
     /\bBash\s+tool/i,
     /\bRunning\s+command/i,
     /\bExecuting\s+command/i,
-    /\$\s*[a-zA-Z]/,
+    /^\s*\$\s+[a-zA-Z]/, // Shell prompt at start of line: "$ command"
   ],
 };
 
@@ -91,15 +91,16 @@ const BUILD_PATTERNS = [
   /\bmake\b/,
 ];
 
-/** Completion indicator patterns */
+/** Completion indicator patterns - require specific context to avoid false positives */
 const COMPLETION_PATTERNS = [
-  /\bcompleted?\b/i,
-  /\bfinished\b/i,
-  /\bdone\b/i,
-  /\bsuccess(ful(ly)?)?\b/i,
-  /\ball\s+(tests?\s+)?pass(ed|ing)?\b/i,
-  /\btask\s+completed?\b/i,
-  /\bimplementation\s+complete\b/i,
+  /\btask\s+(is\s+)?completed?\b/i, // "task completed", "task is complete"
+  /\bsuccessfully\s+completed?\b/i, // "successfully completed"
+  /\bcompleted\s+successfully\b/i, // "completed successfully"
+  /\ball\s+(tests?\s+)?pass(ed|ing)?\b/i, // "all tests passed"
+  /\bimplementation\s+complete\b/i, // "implementation complete"
+  /^(done|finished|completed?)\.?\s*$/im, // "Done." or "Finished" alone on a line
+  /\bprocess\s+(completed?|finished)\b/i, // "process completed"
+  /\bbuild\s+succeeded\b/i, // "build succeeded"
 ];
 
 /** Todo list patterns */
