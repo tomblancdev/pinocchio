@@ -1265,6 +1265,10 @@ async function spawnDockerAgent(args: {
   // SECURITY FIX #8: Track token file path for cleanup (declared outside try for catch block access)
   let tokenFilePath: string | null = null;
 
+  // PR #32 FIX: Variables declared at function scope for proper cleanup in catch block
+  let foregroundLogStream: NodeJS.ReadableStream | null = null;
+  let foregroundDemuxer: DockerStreamDemultiplexer | null = null;
+
   try {
     // Verify workspace path exists
     const stats = await fs.stat(workspace_path);
@@ -1476,10 +1480,7 @@ async function spawnDockerAgent(args: {
     }
 
     // Foreground mode: stream logs in real-time while waiting for completion
-    // PR #32 FIX: Variables declared at function scope for proper cleanup in catch block
     const eventBus = wsServer ? EventBus.getInstance() : null;
-    let foregroundLogStream: NodeJS.ReadableStream | null = null;
-    let foregroundDemuxer: DockerStreamDemultiplexer | null = null;
 
     // Progress tracking for foreground mode
     const foregroundProgressTracker = new ProgressTracker();
