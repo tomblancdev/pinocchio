@@ -1344,12 +1344,70 @@ async function spawnDockerAgent(args: {
       };
     }
 
-    // Foreground mode: wait for completion
+    // Foreground mode: stream logs in real-time while waiting for completion
+    const eventBus = wsServer ? EventBus.getInstance() : null;
+    let foregroundLogStream: NodeJS.ReadableStream | null = null;
+
+    // Start streaming logs in real-time (if WebSocket server is active)
+    if (eventBus) {
+      try {
+        foregroundLogStream = await container.logs({
+          follow: true,
+          stdout: true,
+          stderr: true,
+          timestamps: true,
+        }) as NodeJS.ReadableStream;
+
+        foregroundLogStream.on('data', (chunk: Buffer) => {
+          // Docker log stream has 8-byte header: [stream_type, 0, 0, 0, size (4 bytes)]
+          let content: string;
+          if (chunk.length > 8) {
+            const streamType = chunk[0];
+            if (streamType === 1 || streamType === 2) {
+              content = chunk.slice(8).toString('utf-8').trim();
+            } else {
+              content = chunk.toString('utf-8').trim();
+            }
+          } else {
+            content = chunk.toString('utf-8').trim();
+          }
+
+          if (content) {
+            const lines = content.split('\n').filter(line => line.trim());
+            for (const line of lines) {
+              let level: 'debug' | 'info' | 'warn' | 'error' = 'info';
+              const lowerLine = line.toLowerCase();
+              if (lowerLine.includes('error') || lowerLine.includes('fail') || lowerLine.includes('exception')) {
+                level = 'error';
+              } else if (lowerLine.includes('warn')) {
+                level = 'warn';
+              } else if (lowerLine.includes('debug') || lowerLine.includes('verbose')) {
+                level = 'debug';
+              }
+              eventBus.emitLog(agentId, level, line);
+            }
+          }
+        });
+
+        foregroundLogStream.on('error', (err) => {
+          console.error(`[pinocchio] Foreground log stream error for ${agentId}:`, err.message);
+        });
+      } catch (logError) {
+        console.error(`[pinocchio] Could not start foreground log streaming for ${agentId}:`, logError);
+      }
+    }
+
+    // Wait for completion
     const result = await waitForContainer(container, timeout_ms);
     const endTime = new Date();
     const duration = endTime.getTime() - metadata.startedAt.getTime();
 
-    // Get logs
+    // Clean up log stream
+    if (foregroundLogStream) {
+      foregroundLogStream.removeAllListeners();
+    }
+
+    // Get full logs for the final output
     const logs = await container.logs({
       stdout: true,
       stderr: true,
@@ -1471,57 +1529,122 @@ async function spawnDockerAgent(args: {
   }
 }
 
-// Monitor a background agent
+// Monitor a background agent with real-time log streaming
 async function monitorAgent(agentId: string, container: Docker.Container, timeout: number) {
+  const metadata = agentMetadata.get(agentId);
+  if (!metadata) return;
+
+  // Get the event bus for emitting log events (only if WebSocket server is active)
+  const eventBus = wsServer ? EventBus.getInstance() : null;
+
+  // Stream logs in real-time
+  let logStream: NodeJS.ReadableStream | null = null;
   try {
-    const result = await waitForContainer(container, timeout);
-    const metadata = agentMetadata.get(agentId);
+    logStream = await container.logs({
+      follow: true,
+      stdout: true,
+      stderr: true,
+      timestamps: true,
+    }) as NodeJS.ReadableStream;
 
-    if (metadata) {
-      metadata.status = result.StatusCode === 0 ? "completed" : "failed";
-      metadata.exitCode = result.StatusCode;
-      metadata.endedAt = new Date();
-
-      // Get and store output
-      const logs = await container.logs({ stdout: true, stderr: true, follow: false });
-      metadata.output = logs.toString("utf-8");
-
-      // AUDIT FIX #9: Log background agent completion or failure
-      const duration_ms = metadata.endedAt.getTime() - metadata.startedAt.getTime();
-      const parsed = parseAgentOutput(metadata.output);
-      if (result.StatusCode === 0) {
-        await auditLog("agent.complete", {
-          exit_code: result.StatusCode,
-          duration_ms,
-          files_modified: parsed.filesModified.length,
-          background: true,
-        }, agentId);
-
-        // Emit agent.completed event via WebSocket for background agents
-        if (wsServer) {
-          EventBus.getInstance().emitCompleted(agentId, result.StatusCode, duration_ms, parsed.filesModified);
+    // Parse and emit log events
+    logStream.on('data', (chunk: Buffer) => {
+      // Docker log stream has 8-byte header: [stream_type, 0, 0, 0, size (4 bytes)]
+      // Skip the header and extract the actual log content
+      let content: string;
+      if (chunk.length > 8) {
+        // Check if this is a multiplexed stream (has header)
+        const streamType = chunk[0];
+        if (streamType === 1 || streamType === 2) {
+          // stdout (1) or stderr (2) - skip 8-byte header
+          content = chunk.slice(8).toString('utf-8').trim();
+        } else {
+          // Not a multiplexed stream, use raw content
+          content = chunk.toString('utf-8').trim();
         }
       } else {
-        await auditLog("agent.fail", {
-          exit_code: result.StatusCode,
-          duration_ms,
-          error: "Non-zero exit code",
-          background: true,
-        }, agentId);
+        content = chunk.toString('utf-8').trim();
+      }
 
-        // Emit agent.failed event via WebSocket for background agents
-        if (wsServer) {
-          EventBus.getInstance().emitFailed(agentId, 'Non-zero exit code', result.StatusCode, duration_ms);
+      if (content && eventBus) {
+        // Split by newlines in case multiple lines come in one chunk
+        const lines = content.split('\n').filter(line => line.trim());
+        for (const line of lines) {
+          // Determine log level from content (simple heuristic)
+          let level: 'debug' | 'info' | 'warn' | 'error' = 'info';
+          const lowerLine = line.toLowerCase();
+          if (lowerLine.includes('error') || lowerLine.includes('fail') || lowerLine.includes('exception')) {
+            level = 'error';
+          } else if (lowerLine.includes('warn')) {
+            level = 'warn';
+          } else if (lowerLine.includes('debug') || lowerLine.includes('verbose')) {
+            level = 'debug';
+          }
+
+          eventBus.emitLog(agentId, level, line);
         }
       }
+    });
 
-      // RELIABILITY FIX #4: Persist state when background agent completes
-      await saveAgentState();
+    logStream.on('error', (err) => {
+      console.error(`[pinocchio] Log stream error for ${agentId}:`, err.message);
+    });
+  } catch (logError) {
+    // Log streaming failed but we can still monitor the container
+    console.error(`[pinocchio] Could not start log streaming for ${agentId}:`, logError);
+  }
 
-      // SECURITY FIX #8: Clean up token file after container completes
-      if (metadata.tokenFilePath) {
-        await cleanupTokenFile(metadata.tokenFilePath);
+  try {
+    const result = await waitForContainer(container, timeout);
+
+    // Clean up log stream (it will end naturally when container stops, but be explicit)
+    if (logStream) {
+      logStream.removeAllListeners();
+    }
+
+    metadata.status = result.StatusCode === 0 ? "completed" : "failed";
+    metadata.exitCode = result.StatusCode;
+    metadata.endedAt = new Date();
+
+    // Get and store output
+    const logs = await container.logs({ stdout: true, stderr: true, follow: false });
+    metadata.output = logs.toString("utf-8");
+
+    // AUDIT FIX #9: Log background agent completion or failure
+    const duration_ms = metadata.endedAt.getTime() - metadata.startedAt.getTime();
+    const parsed = parseAgentOutput(metadata.output);
+    if (result.StatusCode === 0) {
+      await auditLog("agent.complete", {
+        exit_code: result.StatusCode,
+        duration_ms,
+        files_modified: parsed.filesModified.length,
+        background: true,
+      }, agentId);
+
+      // Emit agent.completed event via WebSocket for background agents
+      if (wsServer) {
+        EventBus.getInstance().emitCompleted(agentId, result.StatusCode, duration_ms, parsed.filesModified);
       }
+    } else {
+      await auditLog("agent.fail", {
+        exit_code: result.StatusCode,
+        duration_ms,
+        error: "Non-zero exit code",
+        background: true,
+      }, agentId);
+
+      // Emit agent.failed event via WebSocket for background agents
+      if (wsServer) {
+        EventBus.getInstance().emitFailed(agentId, 'Non-zero exit code', result.StatusCode, duration_ms);
+      }
+    }
+
+    // RELIABILITY FIX #4: Persist state when background agent completes
+    await saveAgentState();
+
+    // SECURITY FIX #8: Clean up token file after container completes
+    if (metadata.tokenFilePath) {
+      await cleanupTokenFile(metadata.tokenFilePath);
     }
 
     // Clean up container
@@ -1532,34 +1655,37 @@ async function monitorAgent(agentId: string, container: Docker.Container, timeou
     }
     runningAgents.delete(agentId);
   } catch (error) {
-    const metadata = agentMetadata.get(agentId);
-    if (metadata) {
-      metadata.status = "failed";
-      metadata.endedAt = new Date();
-      metadata.output = `Error: ${error instanceof Error ? error.message : String(error)}`;
-
-      // AUDIT FIX #9: Log background agent failure
-      const duration_ms = metadata.endedAt.getTime() - metadata.startedAt.getTime();
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      await auditLog("agent.fail", {
-        error: errorMessage,
-        duration_ms,
-        background: true,
-      }, agentId);
-
-      // Emit agent.failed event via WebSocket for background agent errors
-      if (wsServer) {
-        EventBus.getInstance().emitFailed(agentId, errorMessage, undefined, duration_ms);
-      }
-
-      // RELIABILITY FIX #4: Persist state when background agent fails
-      await saveAgentState();
-
-      // SECURITY FIX #8: Clean up token file even on error
-      if (metadata.tokenFilePath) {
-        await cleanupTokenFile(metadata.tokenFilePath);
-      }
+    // Clean up log stream on error
+    if (logStream) {
+      logStream.removeAllListeners();
     }
+
+    metadata.status = "failed";
+    metadata.endedAt = new Date();
+    metadata.output = `Error: ${error instanceof Error ? error.message : String(error)}`;
+
+    // AUDIT FIX #9: Log background agent failure
+    const duration_ms = metadata.endedAt.getTime() - metadata.startedAt.getTime();
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    await auditLog("agent.fail", {
+      error: errorMessage,
+      duration_ms,
+      background: true,
+    }, agentId);
+
+    // Emit agent.failed event via WebSocket for background agent errors
+    if (wsServer) {
+      EventBus.getInstance().emitFailed(agentId, errorMessage, undefined, duration_ms);
+    }
+
+    // RELIABILITY FIX #4: Persist state when background agent fails
+    await saveAgentState();
+
+    // SECURITY FIX #8: Clean up token file even on error
+    if (metadata.tokenFilePath) {
+      await cleanupTokenFile(metadata.tokenFilePath);
+    }
+
     runningAgents.delete(agentId);
   }
 }
