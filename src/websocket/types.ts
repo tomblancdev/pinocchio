@@ -16,6 +16,10 @@ export interface WebSocketConfig {
   apiKey?: string;
   subscriptionPolicy: 'open' | 'owner-only' | 'token-based';
   bufferSize: number;
+  tls?: {
+    cert: string;  // Path to certificate file
+    key: string;   // Path to key file
+  };
 }
 
 export const DEFAULT_WEBSOCKET_CONFIG: WebSocketConfig = {
@@ -160,6 +164,8 @@ export const ErrorCodes = {
   UNAUTHORIZED: 4003,
   RATE_LIMITED: 4004,
   SUBSCRIPTION_DENIED: 4005,
+  INTERNAL_ERROR: 4006,
+  CONNECTION_TIMEOUT: 4007,
 } as const;
 
 // ============================================================================
@@ -169,11 +175,11 @@ export const ErrorCodes = {
 export function isClientMessage(data: unknown): data is ClientMessage {
   if (typeof data !== 'object' || data === null) return false;
   const msg = data as Record<string, unknown>;
-  return (
-    msg.type === 'subscribe' ||
-    msg.type === 'unsubscribe' ||
-    msg.type === 'ping'
-  );
+  if (msg.type === 'ping') return true;
+  if (msg.type === 'subscribe' || msg.type === 'unsubscribe') {
+    return typeof msg.agentId === 'string' && msg.agentId.length > 0;
+  }
+  return false;
 }
 
 export function isAgentEvent(data: unknown): data is AgentEvent {
