@@ -18,6 +18,136 @@ import { EventBus } from './websocket/events.js';
 import { PinocchioWebSocket } from './websocket/server.js';
 import { WebSocketConfig } from './websocket/types.js';
 
+// PR #32 FIX: Docker stream demultiplexer
+// Docker multiplexed streams have an 8-byte header per message:
+// - Byte 0: stream type (1=stdout, 2=stderr)
+// - Bytes 1-3: reserved (zeros)
+// - Bytes 4-7: message size (big-endian uint32)
+// This class handles buffering incomplete chunks and iterating through multiple messages.
+interface DockerLogMessage {
+  streamType: 1 | 2; // 1=stdout, 2=stderr
+  content: string;
+}
+
+class DockerStreamDemultiplexer {
+  private buffer: Buffer = Buffer.alloc(0);
+  private static readonly HEADER_SIZE = 8;
+
+  // Process incoming chunk and return complete messages
+  processChunk(chunk: Buffer): DockerLogMessage[] {
+    // Append new chunk to buffer
+    this.buffer = Buffer.concat([this.buffer, chunk]);
+
+    const messages: DockerLogMessage[] = [];
+
+    // Process all complete messages in the buffer
+    while (this.buffer.length >= DockerStreamDemultiplexer.HEADER_SIZE) {
+      const streamType = this.buffer[0];
+
+      // Validate stream type (1=stdout, 2=stderr)
+      // If not a valid multiplexed stream, treat the entire buffer as raw content
+      if (streamType !== 1 && streamType !== 2) {
+        // Not a multiplexed stream - emit raw content and clear buffer
+        const content = this.buffer.toString('utf-8').trim();
+        if (content) {
+          messages.push({ streamType: 1, content });
+        }
+        this.buffer = Buffer.alloc(0);
+        break;
+      }
+
+      // Read message size from bytes 4-7 (big-endian uint32)
+      const messageSize = this.buffer.readUInt32BE(4);
+
+      // Validate message size (sanity check: max 10MB per message)
+      const MAX_MESSAGE_SIZE = 10 * 1024 * 1024;
+      if (messageSize > MAX_MESSAGE_SIZE) {
+        // Invalid size - likely corrupted stream, treat as raw and clear
+        console.error(`[pinocchio] Docker stream: invalid message size ${messageSize}, treating as raw`);
+        const content = this.buffer.toString('utf-8').trim();
+        if (content) {
+          messages.push({ streamType: 1, content });
+        }
+        this.buffer = Buffer.alloc(0);
+        break;
+      }
+
+      const totalMessageLength = DockerStreamDemultiplexer.HEADER_SIZE + messageSize;
+
+      // Check if we have the complete message
+      if (this.buffer.length < totalMessageLength) {
+        // Incomplete message, wait for more data
+        break;
+      }
+
+      // Extract the message content
+      const content = this.buffer.slice(
+        DockerStreamDemultiplexer.HEADER_SIZE,
+        totalMessageLength
+      ).toString('utf-8');
+
+      if (content.trim()) {
+        messages.push({
+          streamType: streamType as 1 | 2,
+          content: content.trim(),
+        });
+      }
+
+      // Remove processed message from buffer
+      this.buffer = this.buffer.slice(totalMessageLength);
+    }
+
+    return messages;
+  }
+
+  // Clear the buffer (for cleanup)
+  clear(): void {
+    this.buffer = Buffer.alloc(0);
+  }
+}
+
+// Helper function to determine log level from content and stream type
+function determineLogLevel(
+  content: string,
+  streamType: 1 | 2
+): 'debug' | 'info' | 'warn' | 'error' {
+  const lowerContent = content.toLowerCase();
+
+  // Check content for keywords
+  if (lowerContent.includes('error') || lowerContent.includes('fail') || lowerContent.includes('exception')) {
+    return 'error';
+  }
+  if (lowerContent.includes('warn')) {
+    return 'warn';
+  }
+  if (lowerContent.includes('debug') || lowerContent.includes('verbose')) {
+    return 'debug';
+  }
+
+  // Use stream type as hint: stderr defaults to warn
+  if (streamType === 2) {
+    return 'warn';
+  }
+
+  return 'info';
+}
+
+// Helper function to process Docker log messages and emit to event bus
+function emitLogMessages(
+  agentId: string,
+  messages: DockerLogMessage[],
+  eventBus: EventBus
+): void {
+  for (const msg of messages) {
+    // Split by newlines in case multiple lines come in one message
+    const lines = msg.content.split('\n').filter(line => line.trim());
+    for (const line of lines) {
+      const level = determineLogLevel(line, msg.streamType);
+      eventBus.emitLog(agentId, level, line);
+    }
+  }
+}
+
 // SECURITY FIX #8: Directory for secure token files
 // Tokens are written to files instead of passed via environment variables
 // to prevent exposure in `docker inspect` output
@@ -1345,8 +1475,10 @@ async function spawnDockerAgent(args: {
     }
 
     // Foreground mode: stream logs in real-time while waiting for completion
+    // PR #32 FIX: Variables declared at function scope for proper cleanup in catch block
     const eventBus = wsServer ? EventBus.getInstance() : null;
     let foregroundLogStream: NodeJS.ReadableStream | null = null;
+    let foregroundDemuxer: DockerStreamDemultiplexer | null = null;
 
     // Start streaming logs in real-time (if WebSocket server is active)
     if (eventBus) {
@@ -1358,34 +1490,13 @@ async function spawnDockerAgent(args: {
           timestamps: true,
         }) as NodeJS.ReadableStream;
 
-        foregroundLogStream.on('data', (chunk: Buffer) => {
-          // Docker log stream has 8-byte header: [stream_type, 0, 0, 0, size (4 bytes)]
-          let content: string;
-          if (chunk.length > 8) {
-            const streamType = chunk[0];
-            if (streamType === 1 || streamType === 2) {
-              content = chunk.slice(8).toString('utf-8').trim();
-            } else {
-              content = chunk.toString('utf-8').trim();
-            }
-          } else {
-            content = chunk.toString('utf-8').trim();
-          }
+        // PR #32 FIX: Use proper demultiplexer for Docker stream parsing
+        foregroundDemuxer = new DockerStreamDemultiplexer();
 
-          if (content) {
-            const lines = content.split('\n').filter(line => line.trim());
-            for (const line of lines) {
-              let level: 'debug' | 'info' | 'warn' | 'error' = 'info';
-              const lowerLine = line.toLowerCase();
-              if (lowerLine.includes('error') || lowerLine.includes('fail') || lowerLine.includes('exception')) {
-                level = 'error';
-              } else if (lowerLine.includes('warn')) {
-                level = 'warn';
-              } else if (lowerLine.includes('debug') || lowerLine.includes('verbose')) {
-                level = 'debug';
-              }
-              eventBus.emitLog(agentId, level, line);
-            }
+        foregroundLogStream.on('data', (chunk: Buffer) => {
+          if (foregroundDemuxer && eventBus) {
+            const messages = foregroundDemuxer.processChunk(chunk);
+            emitLogMessages(agentId, messages, eventBus);
           }
         });
 
@@ -1402,9 +1513,12 @@ async function spawnDockerAgent(args: {
     const endTime = new Date();
     const duration = endTime.getTime() - metadata.startedAt.getTime();
 
-    // Clean up log stream
+    // Clean up log stream and demultiplexer
     if (foregroundLogStream) {
       foregroundLogStream.removeAllListeners();
+    }
+    if (foregroundDemuxer) {
+      foregroundDemuxer.clear();
     }
 
     // Get full logs for the final output
@@ -1490,6 +1604,15 @@ async function spawnDockerAgent(args: {
     // if the error occurred before container.start() succeeded).
     pendingReservations.delete(agentId);
 
+    // PR #32 FIX: Clean up foreground log stream and demultiplexer on error
+    // This prevents memory leaks if waitForContainer() throws
+    if (foregroundLogStream) {
+      foregroundLogStream.removeAllListeners();
+    }
+    if (foregroundDemuxer) {
+      foregroundDemuxer.clear();
+    }
+
     // Clean up on error
     runningAgents.delete(agentId);
     const metadata = agentMetadata.get(agentId);
@@ -1538,7 +1661,9 @@ async function monitorAgent(agentId: string, container: Docker.Container, timeou
   const eventBus = wsServer ? EventBus.getInstance() : null;
 
   // Stream logs in real-time
+  // PR #32 FIX: Use proper demultiplexer for Docker stream parsing
   let logStream: NodeJS.ReadableStream | null = null;
+  let demuxer: DockerStreamDemultiplexer | null = null;
   try {
     logStream = await container.logs({
       follow: true,
@@ -1547,42 +1672,13 @@ async function monitorAgent(agentId: string, container: Docker.Container, timeou
       timestamps: true,
     }) as NodeJS.ReadableStream;
 
-    // Parse and emit log events
+    // PR #32 FIX: Use proper demultiplexer for Docker stream parsing
+    demuxer = new DockerStreamDemultiplexer();
+
     logStream.on('data', (chunk: Buffer) => {
-      // Docker log stream has 8-byte header: [stream_type, 0, 0, 0, size (4 bytes)]
-      // Skip the header and extract the actual log content
-      let content: string;
-      if (chunk.length > 8) {
-        // Check if this is a multiplexed stream (has header)
-        const streamType = chunk[0];
-        if (streamType === 1 || streamType === 2) {
-          // stdout (1) or stderr (2) - skip 8-byte header
-          content = chunk.slice(8).toString('utf-8').trim();
-        } else {
-          // Not a multiplexed stream, use raw content
-          content = chunk.toString('utf-8').trim();
-        }
-      } else {
-        content = chunk.toString('utf-8').trim();
-      }
-
-      if (content && eventBus) {
-        // Split by newlines in case multiple lines come in one chunk
-        const lines = content.split('\n').filter(line => line.trim());
-        for (const line of lines) {
-          // Determine log level from content (simple heuristic)
-          let level: 'debug' | 'info' | 'warn' | 'error' = 'info';
-          const lowerLine = line.toLowerCase();
-          if (lowerLine.includes('error') || lowerLine.includes('fail') || lowerLine.includes('exception')) {
-            level = 'error';
-          } else if (lowerLine.includes('warn')) {
-            level = 'warn';
-          } else if (lowerLine.includes('debug') || lowerLine.includes('verbose')) {
-            level = 'debug';
-          }
-
-          eventBus.emitLog(agentId, level, line);
-        }
+      if (demuxer && eventBus) {
+        const messages = demuxer.processChunk(chunk);
+        emitLogMessages(agentId, messages, eventBus);
       }
     });
 
@@ -1597,9 +1693,12 @@ async function monitorAgent(agentId: string, container: Docker.Container, timeou
   try {
     const result = await waitForContainer(container, timeout);
 
-    // Clean up log stream (it will end naturally when container stops, but be explicit)
+    // Clean up log stream and demultiplexer (stream ends naturally when container stops, but be explicit)
     if (logStream) {
       logStream.removeAllListeners();
+    }
+    if (demuxer) {
+      demuxer.clear();
     }
 
     metadata.status = result.StatusCode === 0 ? "completed" : "failed";
@@ -1655,9 +1754,12 @@ async function monitorAgent(agentId: string, container: Docker.Container, timeou
     }
     runningAgents.delete(agentId);
   } catch (error) {
-    // Clean up log stream on error
+    // Clean up log stream and demultiplexer on error
     if (logStream) {
       logStream.removeAllListeners();
+    }
+    if (demuxer) {
+      demuxer.clear();
     }
 
     metadata.status = "failed";
