@@ -91,12 +91,12 @@ export class EventBus extends EventEmitter {
     this.emitEvent(event);
   }
 
-  emitProgress(agentId: string, progress: number, message?: string): void {
+  emitProgress(agentId: string, progress: number, message?: string, filesModified?: string[]): void {
     const event: AgentProgressEvent = {
       type: 'agent.progress',
       agentId,
       timestamp: new Date().toISOString(),
-      data: { progress, message },
+      data: { progress, message, filesModified },
     };
     this.emitEvent(event);
   }

@@ -70,6 +70,7 @@ export interface AgentProgressEvent extends BaseAgentEvent {
   data: {
     progress: number; // 0-100
     message?: string;
+    filesModified?: string[];
   };
 }
 
