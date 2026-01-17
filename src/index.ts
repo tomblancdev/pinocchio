@@ -14,6 +14,9 @@ import * as path from "path";
 import * as fs from "fs/promises";
 import { glob } from "glob";
 import * as crypto from "crypto";
+import { EventBus } from './websocket/events.js';
+import { PinocchioWebSocket } from './websocket/server.js';
+import { WebSocketConfig, AgentEvent } from './websocket/types.js';
 
 // SECURITY FIX #8: Directory for secure token files
 // Tokens are written to files instead of passed via environment variables
@@ -47,6 +50,8 @@ interface AgentConfig {
     token?: string;           // PAT for GitHub API (preferred over gh CLI)
     defaultAccess?: "none" | "read" | "comment" | "write" | "manage" | "admin";
   };
+  // WebSocket configuration
+  websocket?: WebSocketConfig;
 }
 
 // Default config
@@ -54,6 +59,14 @@ const DEFAULT_CONFIG: AgentConfig = {
   allowedWorkspaces: [],
   blockedPaths: ["/etc", "/var", "/root", "/boot", "/sys", "/proc", "/dev"],
   pendingApprovals: [],
+  websocket: {
+    enabled: true,
+    port: 3001,
+    bindAddress: '127.0.0.1',
+    auth: 'none',
+    subscriptionPolicy: 'open',
+    bufferSize: 1000,
+  },
 };
 
 // AUDIT FIX #9: Audit event structure
@@ -313,6 +326,9 @@ interface AgentMetadata {
 // Track running agents and their metadata
 const runningAgents = new Map<string, Docker.Container>();
 const agentMetadata = new Map<string, AgentMetadata>();
+
+// WebSocket server instance (initialized in main if enabled)
+let wsServer: PinocchioWebSocket | null = null;
 
 // SECURITY FIX #5: Rate limiting configuration to prevent DoS attacks.
 // Limits how many agents can run concurrently and how fast they can be spawned.
@@ -1296,6 +1312,21 @@ async function spawnDockerAgent(args: {
       image: CONFIG.imageName,
     }, agentId);
 
+    // Emit agent.started event via WebSocket
+    if (wsServer) {
+      const startedEvent: AgentEvent = {
+        type: 'agent.started',
+        agentId,
+        timestamp: new Date().toISOString(),
+        data: {
+          task: sanitizedTask.slice(0, 500),
+          workspace: workspace_path,
+          writablePaths: resolvedWritablePaths,
+        },
+      };
+      EventBus.getInstance().emit(startedEvent);
+    }
+
     // SECURITY FIX #5.1: Record spawn timestamp ONLY after successful container start.
     // This ensures failed attempts don't count against the rate limit.
     recordSpawnTimestamp(Date.now());
@@ -1351,12 +1382,42 @@ async function spawnDockerAgent(args: {
         duration_ms: duration,
         files_modified: parsed.filesModified.length,
       }, agentId);
+
+      // Emit agent.completed event via WebSocket
+      if (wsServer) {
+        const completedEvent: AgentEvent = {
+          type: 'agent.completed',
+          agentId,
+          timestamp: new Date().toISOString(),
+          data: {
+            exitCode: result.StatusCode,
+            duration,
+            filesModified: parsed.filesModified,
+          },
+        };
+        EventBus.getInstance().emit(completedEvent);
+      }
     } else {
       await auditLog("agent.fail", {
         exit_code: result.StatusCode,
         duration_ms: duration,
         error: "Non-zero exit code",
       }, agentId);
+
+      // Emit agent.failed event via WebSocket
+      if (wsServer) {
+        const failedEvent: AgentEvent = {
+          type: 'agent.failed',
+          agentId,
+          timestamp: new Date().toISOString(),
+          data: {
+            exitCode: result.StatusCode,
+            duration,
+            error: 'Non-zero exit code',
+          },
+        };
+        EventBus.getInstance().emit(failedEvent);
+      }
     }
 
     // RELIABILITY FIX #4: Persist state when agent completes
@@ -1425,6 +1486,20 @@ async function spawnDockerAgent(args: {
       phase: "startup",
     }, agentId);
 
+    // Emit agent.failed event via WebSocket
+    if (wsServer) {
+      const failedEvent: AgentEvent = {
+        type: 'agent.failed',
+        agentId,
+        timestamp: new Date().toISOString(),
+        data: {
+          error: errorMessage,
+          phase: 'startup',
+        },
+      };
+      EventBus.getInstance().emit(failedEvent);
+    }
+
     return {
       content: [{
         type: "text" as const,
@@ -1460,6 +1535,22 @@ async function monitorAgent(agentId: string, container: Docker.Container, timeou
           files_modified: parsed.filesModified.length,
           background: true,
         }, agentId);
+
+        // Emit agent.completed event via WebSocket for background agents
+        if (wsServer) {
+          const completedEvent: AgentEvent = {
+            type: 'agent.completed',
+            agentId,
+            timestamp: new Date().toISOString(),
+            data: {
+              exitCode: result.StatusCode,
+              duration: duration_ms,
+              filesModified: parsed.filesModified,
+              background: true,
+            },
+          };
+          EventBus.getInstance().emit(completedEvent);
+        }
       } else {
         await auditLog("agent.fail", {
           exit_code: result.StatusCode,
@@ -1467,6 +1558,22 @@ async function monitorAgent(agentId: string, container: Docker.Container, timeou
           error: "Non-zero exit code",
           background: true,
         }, agentId);
+
+        // Emit agent.failed event via WebSocket for background agents
+        if (wsServer) {
+          const failedEvent: AgentEvent = {
+            type: 'agent.failed',
+            agentId,
+            timestamp: new Date().toISOString(),
+            data: {
+              exitCode: result.StatusCode,
+              duration: duration_ms,
+              error: 'Non-zero exit code',
+              background: true,
+            },
+          };
+          EventBus.getInstance().emit(failedEvent);
+        }
       }
 
       // RELIABILITY FIX #4: Persist state when background agent completes
@@ -1494,11 +1601,27 @@ async function monitorAgent(agentId: string, container: Docker.Container, timeou
 
       // AUDIT FIX #9: Log background agent failure
       const duration_ms = metadata.endedAt.getTime() - metadata.startedAt.getTime();
+      const errorMessage = error instanceof Error ? error.message : String(error);
       await auditLog("agent.fail", {
-        error: error instanceof Error ? error.message : String(error),
+        error: errorMessage,
         duration_ms,
         background: true,
       }, agentId);
+
+      // Emit agent.failed event via WebSocket for background agent errors
+      if (wsServer) {
+        const failedEvent: AgentEvent = {
+          type: 'agent.failed',
+          agentId,
+          timestamp: new Date().toISOString(),
+          data: {
+            error: errorMessage,
+            duration: duration_ms,
+            background: true,
+          },
+        };
+        EventBus.getInstance().emit(failedEvent);
+      }
 
       // RELIABILITY FIX #4: Persist state when background agent fails
       await saveAgentState();
@@ -2096,6 +2219,12 @@ async function gracefulShutdown(signal: string): Promise<void> {
     ]);
   }
 
+  // Close WebSocket server if running
+  if (wsServer) {
+    console.error("[pinocchio] Closing WebSocket server...");
+    await wsServer.close();
+  }
+
   console.error("[pinocchio] Shutdown complete");
   process.exit(0);
 }
@@ -2117,6 +2246,14 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("[pinocchio] Server started");
+
+  // Initialize WebSocket server if enabled
+  const config = await loadConfig();
+  if (config.websocket?.enabled) {
+    wsServer = new PinocchioWebSocket(config.websocket);
+    wsServer.start();
+    console.error('[pinocchio] WebSocket server started on port', config.websocket.port);
+  }
 }
 
 main().catch((error) => {
