@@ -271,6 +271,9 @@ export class PinocchioWebSocket {
   broadcast(event: AgentEvent): void {
     for (const [ws, state] of this.clients) {
       // Check if client is subscribed to this agent or '*'
+      // Subscription precedence: specific agent subscription takes precedence over wildcard ('*').
+      // If a client has both a subscription for a specific agentId AND a wildcard subscription
+      // with different log levels, only the specific subscription's log levels are used.
       const levels = state.subscriptions.get(event.agentId) || state.subscriptions.get('*');
       if (!levels) continue;
 
