@@ -12,6 +12,7 @@
 - **✍️ Granular Write Access** - Explicit paths/patterns for write permissions
 - **⏱️ Configurable Timeouts** - Prevent runaway agents (default: 1h, max: 24h)
 - **🔄 Background Execution** - Run agents async with status monitoring
+- **📡 WebSocket Events** - Real-time agent status and log streaming
 - **🐙 GitHub Integration** - 6 permission levels from read-only to admin
 - **⚙️ Unified Configuration** - Single tool for all settings
 
@@ -116,12 +117,54 @@ Pinocchio implements defense-in-depth security:
 
 See [security-review.md](./security-review.md) for the full security assessment.
 
+## 📡 WebSocket Events
+
+Pinocchio provides real-time event streaming via WebSocket for monitoring agent activity.
+
+### Connection
+
+```
+ws://127.0.0.1:3001
+```
+
+Default port is `3001`, configurable via `WEBSOCKET_PORT` environment variable.
+
+### Events
+
+| Event | Description |
+|-------|-------------|
+| `agent.started` | Agent container launched |
+| `agent.log` | Agent output (debug/info/warn/error) |
+| `agent.progress` | Task progress update (0-100%) |
+| `agent.completed` | Agent finished successfully |
+| `agent.failed` | Agent exited with error |
+
+### Quick Example
+
+```javascript
+const ws = new WebSocket('ws://127.0.0.1:3001');
+
+// Subscribe to all agents
+ws.send(JSON.stringify({ type: 'subscribe', agentId: '*' }));
+
+ws.onmessage = (msg) => {
+  const { event } = JSON.parse(msg.data);
+  console.log(`[${event.type}] ${event.agentId}`);
+};
+```
+
+See [USAGE.md](./USAGE.md#websocket-events) for detailed examples.
+
 ## 📁 Project Structure
 
 ```
 pinocchio/
 ├── src/
-│   └── index.ts          # MCP server implementation
+│   ├── index.ts          # MCP server implementation
+│   └── websocket/        # WebSocket server
+│       ├── server.ts     # WebSocket server implementation
+│       ├── types.ts      # Event types and interfaces
+│       └── events.ts     # EventBus for publishing events
 ├── agent-image/
 │   ├── Dockerfile        # Claude agent container image
 │   └── entrypoint.sh     # Agent startup script
@@ -152,6 +195,9 @@ pinocchio/
 | `HOST_CONFIG_DIR` | `~/.config/pinocchio` | Pinocchio config directory |
 | `HOST_GH_CONFIG` | `~/.config/gh` | GitHub CLI config |
 | `ABSOLUTE_MAX_TIMEOUT` | 86400000 | Maximum timeout (24h) |
+| `WEBSOCKET_PORT` | 3001 | WebSocket server port |
+| `WEBSOCKET_AUTH` | `none` | Auth mode: `none` or `api-key` |
+| `WEBSOCKET_API_KEY` | - | API key when auth is `api-key` |
 
 ## 🤝 Contributing
 
