@@ -1131,7 +1131,7 @@ async function createSecureTokenFile(agentId: string, token: string): Promise<st
 // SECURITY FIX #8.1: Added cleanup flag to prevent double cleanup race condition.
 // Multiple code paths can trigger cleanup (foreground completion, background monitor, error handlers).
 // The cleanedTokenFiles Set ensures each file is only deleted once.
-async function cleanupTokenFile(tokenFilePath: string): Promise<void> {
+export async function cleanupTokenFile(tokenFilePath: string): Promise<void> {
   // SECURITY FIX #8.1: Check if already cleaned up to prevent race condition
   if (cleanedTokenFiles.has(tokenFilePath)) {
     return;

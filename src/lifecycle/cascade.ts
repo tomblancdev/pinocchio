@@ -11,6 +11,7 @@ import {
   getSpawnTree,
   AgentMetadata,
   SpawnTree,
+  cleanupTokenFile,
 } from "../index.js";
 import {
   invalidateTokensForAgent,
@@ -83,11 +84,21 @@ export async function terminateWithChildren(
       }
       invalidateTokensForAgent(agentId);
 
+      // Clean up token file for this agent (SECURITY FIX #8)
+      if (metadata.tokenFilePath) {
+        await cleanupTokenFile(metadata.tokenFilePath);
+      }
+
       // Stop the container
       const container = runningAgents.get(agentId);
       if (container) {
         try {
-          await container.stop();
+          // Use kill() for SIGKILL, stop() for SIGTERM (default graceful shutdown)
+          if (signal === "SIGKILL") {
+            await container.kill({ signal });
+          } else {
+            await container.stop();
+          }
           await container.remove({ force: true });
         } catch (containerError) {
           // Container might already be stopped/removed
@@ -98,7 +109,12 @@ export async function terminateWithChildren(
         // Try to get container directly by ID (might not be in runningAgents map)
         try {
           const directContainer = docker.getContainer(agentId);
-          await directContainer.stop();
+          // Use kill() for SIGKILL, stop() for SIGTERM (default graceful shutdown)
+          if (signal === "SIGKILL") {
+            await directContainer.kill({ signal });
+          } else {
+            await directContainer.stop();
+          }
           await directContainer.remove({ force: true });
         } catch (directError) {
           // Container might not exist or already be stopped
@@ -110,10 +126,12 @@ export async function terminateWithChildren(
       await updateMetadata(agentId, "failed", "[pinocchio] Agent terminated via cascade termination");
       result.terminated.push(agentId);
       console.error(`[pinocchio] Cascade termination: Terminated agent ${agentId}`);
+    } else if (metadata.status === "completed" || metadata.status === "failed") {
+      // Skip already terminated agents - don't count them as "terminated" by this operation
+      console.error(`[pinocchio] Cascade termination: Agent ${agentId} already terminated (status: ${metadata.status}), skipping`);
     } else {
-      // Agent already terminated, just count it
-      console.error(`[pinocchio] Cascade termination: Agent ${agentId} already in status: ${metadata.status}`);
-      result.terminated.push(agentId);
+      // Agent in unknown status, log but don't add to terminated list
+      console.error(`[pinocchio] Cascade termination: Agent ${agentId} in unexpected status: ${metadata.status}`);
     }
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
