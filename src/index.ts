@@ -2036,6 +2036,35 @@ async function spawnDockerAgent(args: {
       }
     }
 
+    // Issue #46: Generate treeId for this root agent's spawn tree
+    // Issue #49: For child agents, inherit the parent's treeId instead of generating a new one
+    // NOTE: Moved before container creation so token can be injected into env vars
+    const treeId = parentTreeId ?? `tree-${crypto.randomUUID()}`;
+
+    // Issue #48: Generate session token for this agent
+    // Root agents get tokens that allow them to spawn children (if config permits)
+    // Issue #49: Child agents also get tokens, with inherited hierarchy info
+    // NOTE: Moved before container creation so token can be injected into env vars (Issue #57)
+    const agentSessionToken = generateToken(
+      agentId,
+      treeId,
+      args.parent_agent_id,  // parentAgentId (undefined for root agents)
+      nestingDepth,          // 0 for root, parent.depth + 1 for children
+      nestedSpawnConfig,
+      timeout_ms,
+      github_access !== "none"  // Inherit GitHub token permission if GitHub access is granted
+    );
+    storeSessionToken(agentSessionToken);
+
+    // Issue #57: Inject spawn proxy environment variables if agent can spawn children
+    if (nestedSpawnConfig.enableRecursiveSpawn &&
+        nestingDepth < nestedSpawnConfig.maxNestingDepth) {
+      // Inject spawn proxy configuration
+      envVars.push(`PINOCCHIO_API_URL=http://mcp-server:3001`);
+      envVars.push(`PINOCCHIO_SESSION_TOKEN=${agentSessionToken.token}`);
+      console.error(`[pinocchio] Injected spawn proxy env vars for agent: ${agentId}`);
+    }
+
     // Build bind mounts
     // Workspace is mounted read-only by default for security
     const binds: string[] = [
@@ -2092,24 +2121,7 @@ async function spawnDockerAgent(args: {
     // Store metadata
     // SECURITY FIX #8: Include tokenFilePath for cleanup when container stops
     // Issue #45: Initialize hierarchy tracking fields for root agents
-    // Issue #46: Generate treeId for this root agent's spawn tree
-    // Issue #49: For child agents, inherit the parent's treeId instead of generating a new one
-    const treeId = parentTreeId ?? `tree-${crypto.randomUUID()}`;
-
-    // Issue #48: Generate session token for this agent
-    // Root agents get tokens that allow them to spawn children (if config permits)
-    // Issue #49: Child agents also get tokens, with inherited hierarchy info
-    const agentSessionToken = generateToken(
-      agentId,
-      treeId,
-      args.parent_agent_id,  // parentAgentId (undefined for root agents)
-      nestingDepth,          // 0 for root, parent.depth + 1 for children
-      nestedSpawnConfig,
-      timeout_ms,
-      github_access !== "none"  // Inherit GitHub token permission if GitHub access is granted
-    );
-    storeSessionToken(agentSessionToken);
-
+    // Note: treeId and agentSessionToken are now generated before container creation (Issue #57)
     const metadata: AgentMetadata = {
       id: agentId,
       task: sanitizedTask,
