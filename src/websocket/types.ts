@@ -231,6 +231,15 @@ export interface SpawnRequest {
 }
 
 /**
+ * Quota information returned with successful spawn responses
+ * Issue #53: Depth limit and tree agent quota
+ */
+export interface QuotaInfo {
+  tree_agents_remaining: number;
+  depth_remaining: number;
+}
+
+/**
  * Successful response from POST /api/v1/spawn
  */
 export interface SpawnResponse {
@@ -241,6 +250,7 @@ export interface SpawnResponse {
   duration_ms: number;
   files_modified?: string[];
   error?: string;
+  quota_info?: QuotaInfo;
 }
 
 /**
@@ -248,6 +258,17 @@ export interface SpawnResponse {
  */
 export interface SpawnErrorResponse {
   error: string;
+}
+
+/**
+ * Issue #53: Quota enforcement error responses
+ */
+export interface QuotaErrorResponse {
+  error: string;
+  current_depth?: number;
+  max_depth?: number;
+  current_count?: number;
+  max_agents?: number;
 }
 
 /**
@@ -310,6 +331,38 @@ export type SpawnHandler = (args: SpawnHandlerArgs) => Promise<SpawnHandlerResul
  * Handler function type for validating session tokens
  */
 export type TokenValidator = (token: string) => TokenValidationResult;
+
+/**
+ * Issue #53: Spawn tree info for quota enforcement
+ */
+export interface SpawnTreeInfo {
+  treeId: string;
+  totalAgents: number;
+  status: 'active' | 'terminated';
+}
+
+/**
+ * Issue #53: Quota configuration
+ */
+export interface QuotaConfig {
+  maxAgentsPerTree: number;
+  maxConcurrentAgents: number;
+}
+
+/**
+ * Issue #53: Handler function type for getting spawn tree info
+ */
+export type TreeInfoGetter = (treeId: string) => SpawnTreeInfo | undefined;
+
+/**
+ * Issue #53: Handler function type for getting running agent count
+ */
+export type RunningAgentCounter = () => number;
+
+/**
+ * Issue #53: Handler function type for getting quota config
+ */
+export type QuotaConfigGetter = () => QuotaConfig;
 
 /**
  * Type guard for SpawnRequest

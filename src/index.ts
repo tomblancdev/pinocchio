@@ -970,6 +970,33 @@ async function handleSpawnFromHttp(args: SpawnHandlerArgs): Promise<SpawnHandler
   }
 }
 
+// Issue #53: Tree info getter for WebSocket quota enforcement
+function getTreeInfoForHttp(treeId: string): { treeId: string; totalAgents: number; status: 'active' | 'terminated' } | undefined {
+  const tree = getSpawnTree(treeId);
+  if (!tree) return undefined;
+  return {
+    treeId: tree.treeId,
+    totalAgents: tree.totalAgents,
+    status: tree.status,
+  };
+}
+
+// Issue #53: Running agent counter for WebSocket quota enforcement
+function getRunningAgentCountForHttp(): number {
+  return runningAgents.size;
+}
+
+// Issue #53: Quota config getter for WebSocket quota enforcement
+function getQuotaConfigForHttp(): { maxAgentsPerTree: number; maxConcurrentAgents: number } {
+  // Load fresh config to get nested spawn settings
+  // Note: We use synchronous defaults here since this is called frequently
+  // and loadConfig() is async. The defaults match RATE_LIMIT and DEFAULT_NESTED_SPAWN_CONFIG
+  return {
+    maxAgentsPerTree: Number(process.env.MAX_AGENTS_PER_TREE) || DEFAULT_NESTED_SPAWN_CONFIG.maxAgentsPerTree,
+    maxConcurrentAgents: Number(process.env.MAX_CONCURRENT_AGENTS) || 5,
+  };
+}
+
 // SECURITY FIX #5: Rate limiting configuration to prevent DoS attacks.
 // Limits how many agents can run concurrently and how fast they can be spawned.
 const RATE_LIMIT = {
@@ -3396,6 +3423,11 @@ async function main() {
       // Issue #50: Register handlers for HTTP spawn endpoint
       wsServer.setSpawnHandler(handleSpawnFromHttp);
       wsServer.setTokenValidator(validateSessionTokenForHttp);
+
+      // Issue #53: Register quota enforcement handlers
+      wsServer.setTreeInfoGetter(getTreeInfoForHttp);
+      wsServer.setRunningAgentCounter(getRunningAgentCountForHttp);
+      wsServer.setQuotaConfigGetter(getQuotaConfigForHttp);
 
       wsServer.start();
       console.error('[pinocchio] WebSocket server started on port', config.websocket.port);
