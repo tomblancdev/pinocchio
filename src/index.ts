@@ -792,6 +792,11 @@ export function getAgentMetadata(agentId: string): AgentMetadata | undefined {
   return agentMetadata.get(agentId);
 }
 
+// Issue #61: Get all agent metadata (for orphan detection)
+export function getAllAgentMetadata(): Map<string, AgentMetadata> {
+  return agentMetadata;
+}
+
 // Issue #46: Update tree agent count (delta can be positive or negative)
 async function updateTreeAgentCount(treeId: string, delta: number): Promise<void> {
   const tree = spawnTrees.get(treeId);

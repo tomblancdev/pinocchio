@@ -9,3 +9,14 @@ export {
   terminateTree,
   CascadeTerminationResult,
 } from "./cascade.js";
+
+export {
+  detectOrphanedAgents,
+  cleanupOrphanedAgents,
+  startOrphanDetection,
+  stopOrphanDetection,
+  getOrphanDetectionConfig,
+  isOrphanDetectionRunning,
+  OrphanedAgent,
+  OrphanDetectionConfig,
+} from "./orphan.js";
