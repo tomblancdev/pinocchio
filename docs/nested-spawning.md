@@ -466,7 +466,7 @@ File: `~/.config/pinocchio/data/trees.json`
     "rootAgentId": "agent-abc123",
     "totalAgents": 3,
     "maxDepthReached": 2,
-    "createdAt": "2024-01-15T10:30:00Z",
+    "createdAt": "2026-01-15T10:30:00Z",
     "status": "active"
   }
 }
@@ -525,7 +525,7 @@ All nested spawning events are logged for debugging and security auditing:
 
 ```json
 {
-  "timestamp": "2024-01-15T10:35:00Z",
+  "timestamp": "2026-01-15T10:35:00Z",
   "event": "spawn.nested",
   "agentId": "agent-def456",
   "parentAgentId": "agent-abc123",
@@ -577,4 +577,3 @@ cat ~/.config/pinocchio/data/tokens.json | jq 'keys'
 
 - [Nested Spawning User Guide](guides/nested-spawning-guide.md) - Getting started guide
 - [Nested Spawning API Reference](api/nested-spawning-api.md) - Complete API documentation
-- [Security Model](security.md) - Detailed security documentation

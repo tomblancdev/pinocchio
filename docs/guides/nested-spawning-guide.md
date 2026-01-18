@@ -701,7 +701,7 @@ get_agent_status({ agent_id: "agent-abc123" })
 
 Subscribe to real-time events for a spawn tree:
 
-```javascript
+```typescript
 const ws = new WebSocket('ws://localhost:3001');
 
 ws.send(JSON.stringify({
