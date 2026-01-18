@@ -478,6 +478,9 @@ interface PersistedAgentMetadata {
   childAgentIds?: string[];
   nestingDepth?: number;
   treeId?: string;
+
+  // Issue #48: Session token for nested agent authentication
+  sessionToken?: string;
 }
 
 // Issue #46: Serializable spawn tree for persistence
@@ -547,6 +550,8 @@ async function loadAgentState(): Promise<void> {
         childAgentIds: item.childAgentIds ?? [],
         nestingDepth: item.nestingDepth ?? 0,
         treeId: item.treeId ?? `tree-legacy-${item.id}`,
+        // Issue #48: Session token (will be validated/re-signed after agent state loads)
+        sessionToken: item.sessionToken,
       };
 
       // If agent was marked as running but server restarted, mark as failed
@@ -595,6 +600,8 @@ async function saveAgentState(): Promise<void> {
         childAgentIds: metadata.childAgentIds,
         nestingDepth: metadata.nestingDepth,
         treeId: metadata.treeId,
+        // Issue #48: Persist session token
+        sessionToken: metadata.sessionToken,
       });
     }
 
@@ -717,6 +724,9 @@ interface AgentMetadata {
   childAgentIds: string[];       // IDs of spawned children
   nestingDepth: number;          // 0 for root, increments per level
   treeId: string;                // Unique ID for the entire spawn tree
+
+  // Issue #48: Session token for nested agent authentication
+  sessionToken?: string;         // The token string (stored separately in sessionTokens map)
 }
 
 // Track running agents and their metadata
@@ -781,6 +791,9 @@ function terminateSpawnTree(treeId: string): void {
   const tree = spawnTrees.get(treeId);
   if (tree && tree.status === "active") {
     tree.status = "terminated";
+    // Issue #48: Invalidate all session tokens for this tree
+    // Tokens are no longer valid once a tree is terminated
+    invalidateTokensForTree(treeId);
     console.error(`[pinocchio] Spawn tree terminated: ${treeId}`);
   }
 }
@@ -815,6 +828,456 @@ function checkAndTerminateTree(treeId: string): void {
 
 // WebSocket server instance (initialized in main if enabled)
 let wsServer: PinocchioWebSocket | null = null;
+
+// =============================================================================
+// Issue #48: Session Token System for Nested Agent Authentication
+// =============================================================================
+// Session tokens are used to authenticate spawn requests from child agents.
+// Tokens are HMAC-signed to prevent forgery and contain hierarchy information
+// for validation. Tokens are short-lived and invalidated when parent terminates.
+
+// Session token configuration
+const SESSION_TOKEN_CONFIG = {
+  // Default token lifetime: 1 hour (capped by agent timeout)
+  defaultTokenLifetimeMs: 60 * 60 * 1000,
+  // Token is 32 bytes hex-encoded (64 characters)
+  tokenBytes: 32,
+  // HMAC algorithm for signing
+  hmacAlgorithm: 'sha256' as const,
+};
+
+// Server secret for HMAC signing (generated on startup)
+// In production, this should be loaded from secure storage
+// Regenerated on server restart, which invalidates all existing tokens
+const serverSecret = crypto.randomBytes(32);
+
+// Issue #48: SessionToken interface
+// Represents a cryptographically signed token for agent authentication
+interface SessionToken {
+  token: string;              // Cryptographically random, 32 bytes hex
+  signature: string;          // HMAC signature of token payload
+  agentId: string;            // Agent this token belongs to
+  treeId: string;             // Spawn tree for validation
+  parentAgentId?: string;     // Parent for hierarchy validation
+  depth: number;              // Current nesting depth
+  maxDepth: number;           // Configured max depth
+  issuedAt: number;           // Unix timestamp (ms)
+  expiresAt: number;          // Token expiry (ms)
+  permissions: {
+    canSpawn: boolean;        // Can this agent spawn children?
+    inheritGitHubToken: boolean;  // Can inherit parent's GitHub token?
+  };
+}
+
+// Issue #48: Serializable session token for persistence
+interface PersistedSessionToken {
+  token: string;
+  signature: string;
+  agentId: string;
+  treeId: string;
+  parentAgentId?: string;
+  depth: number;
+  maxDepth: number;
+  issuedAt: number;
+  expiresAt: number;
+  permissions: {
+    canSpawn: boolean;
+    inheritGitHubToken: boolean;
+  };
+}
+
+// Issue #48: In-memory token store
+// Map from token string to SessionToken for O(1) lookup
+const sessionTokens = new Map<string, SessionToken>();
+
+// Issue #48: State file path for token persistence
+const TOKENS_STATE_FILE = path.join(os.homedir(), ".config", "pinocchio", "tokens.json");
+
+// Issue #48: Generate the HMAC signature for a token payload
+// This prevents token forgery - only the server can create valid signatures
+function signTokenPayload(payload: {
+  token: string;
+  agentId: string;
+  treeId: string;
+  parentAgentId?: string;
+  depth: number;
+  maxDepth: number;
+  issuedAt: number;
+  expiresAt: number;
+  permissions: { canSpawn: boolean; inheritGitHubToken: boolean };
+}): string {
+  const hmac = crypto.createHmac(SESSION_TOKEN_CONFIG.hmacAlgorithm, serverSecret);
+  // Create deterministic string representation of payload
+  const dataToSign = JSON.stringify({
+    token: payload.token,
+    agentId: payload.agentId,
+    treeId: payload.treeId,
+    parentAgentId: payload.parentAgentId || '',
+    depth: payload.depth,
+    maxDepth: payload.maxDepth,
+    issuedAt: payload.issuedAt,
+    expiresAt: payload.expiresAt,
+    canSpawn: payload.permissions.canSpawn,
+    inheritGitHubToken: payload.permissions.inheritGitHubToken,
+  });
+  hmac.update(dataToSign);
+  return hmac.digest('hex');
+}
+
+// Issue #48: Verify that a token's signature is valid
+function verifyTokenSignature(token: SessionToken): boolean {
+  const expectedSignature = signTokenPayload({
+    token: token.token,
+    agentId: token.agentId,
+    treeId: token.treeId,
+    parentAgentId: token.parentAgentId,
+    depth: token.depth,
+    maxDepth: token.maxDepth,
+    issuedAt: token.issuedAt,
+    expiresAt: token.expiresAt,
+    permissions: token.permissions,
+  });
+  // Use timing-safe comparison to prevent timing attacks
+  try {
+    return crypto.timingSafeEqual(
+      Buffer.from(token.signature, 'hex'),
+      Buffer.from(expectedSignature, 'hex')
+    );
+  } catch {
+    // Length mismatch or invalid hex - signature is invalid
+    return false;
+  }
+}
+
+// Issue #48: Generate a new session token for an agent
+// Called when spawning a new agent (root or child)
+function generateSessionToken(
+  agentId: string,
+  treeId: string,
+  parentAgentId: string | undefined,
+  depth: number,
+  nestedSpawnConfig: NestedSpawnConfig,
+  timeoutMs: number,
+  inheritGitHubToken: boolean = false
+): SessionToken {
+  // Generate cryptographically random token
+  const token = crypto.randomBytes(SESSION_TOKEN_CONFIG.tokenBytes).toString('hex');
+
+  const now = Date.now();
+  // Token expiry is the minimum of:
+  // 1. Default token lifetime (1 hour)
+  // 2. Agent timeout (so token expires when agent should be done)
+  const expiresAt = now + Math.min(SESSION_TOKEN_CONFIG.defaultTokenLifetimeMs, timeoutMs);
+
+  // Determine spawn permission based on depth and config
+  const canSpawn = nestedSpawnConfig.enableRecursiveSpawn &&
+                   depth < nestedSpawnConfig.maxNestingDepth;
+
+  const sessionToken: SessionToken = {
+    token,
+    signature: '', // Will be set after signing
+    agentId,
+    treeId,
+    parentAgentId,
+    depth,
+    maxDepth: nestedSpawnConfig.maxNestingDepth,
+    issuedAt: now,
+    expiresAt,
+    permissions: {
+      canSpawn,
+      inheritGitHubToken,
+    },
+  };
+
+  // Sign the token
+  sessionToken.signature = signTokenPayload(sessionToken);
+
+  return sessionToken;
+}
+
+// Issue #48: Store a session token
+function storeSessionToken(sessionToken: SessionToken): void {
+  sessionTokens.set(sessionToken.token, sessionToken);
+  console.error(`[pinocchio] Stored session token for agent: ${sessionToken.agentId} (expires: ${new Date(sessionToken.expiresAt).toISOString()})`);
+
+  // Audit log token generation (don't log the actual token for security)
+  auditLog("token.generated", {
+    treeId: sessionToken.treeId,
+    depth: sessionToken.depth,
+    maxDepth: sessionToken.maxDepth,
+    canSpawn: sessionToken.permissions.canSpawn,
+    inheritGitHubToken: sessionToken.permissions.inheritGitHubToken,
+    expiresAt: new Date(sessionToken.expiresAt).toISOString(),
+  }, sessionToken.agentId).catch(() => {}); // Fire and forget
+}
+
+// Issue #48: Retrieve a session token by token string
+function getSessionToken(tokenString: string): SessionToken | undefined {
+  return sessionTokens.get(tokenString);
+}
+
+// Issue #48: Validation result for session tokens
+interface TokenValidationResult {
+  valid: boolean;
+  token?: SessionToken;
+  error?: string;
+}
+
+// Issue #48: Validate a session token
+// Checks: signature, expiry, tree active, parent running (if applicable)
+function validateSessionToken(tokenString: string): TokenValidationResult {
+  // Check token exists in store
+  const token = sessionTokens.get(tokenString);
+  if (!token) {
+    // Log potential token replay or forgery attempt
+    auditLog("token.validation_failed", {
+      reason: 'Token not found',
+      // Log a prefix of the token for debugging (not full token for security)
+      tokenPrefix: tokenString.slice(0, 8) + '...',
+    }).catch(() => {});
+    return { valid: false, error: 'Token not found' };
+  }
+
+  // Verify signature (protects against tampering)
+  if (!verifyTokenSignature(token)) {
+    console.error(`[pinocchio] Token signature verification failed for agent: ${token.agentId}`);
+    // This is a serious security event - potential tampering
+    auditLog("token.signature_invalid", {
+      reason: 'Signature verification failed',
+      treeId: token.treeId,
+      depth: token.depth,
+    }, token.agentId).catch(() => {});
+    return { valid: false, error: 'Invalid token signature' };
+  }
+
+  // Check expiry
+  const now = Date.now();
+  if (now > token.expiresAt) {
+    auditLog("token.expired", {
+      reason: 'Token expired',
+      expiredAt: new Date(token.expiresAt).toISOString(),
+      treeId: token.treeId,
+    }, token.agentId).catch(() => {});
+    return { valid: false, error: 'Token expired' };
+  }
+
+  // Check if the spawn tree is still active
+  const tree = getSpawnTree(token.treeId);
+  if (!tree) {
+    return { valid: false, error: 'Spawn tree not found' };
+  }
+  if (tree.status === 'terminated') {
+    return { valid: false, error: 'Spawn tree terminated' };
+  }
+
+  // If token has a parent, verify parent is still running
+  if (token.parentAgentId) {
+    const parentMetadata = agentMetadata.get(token.parentAgentId);
+    if (!parentMetadata) {
+      return { valid: false, error: 'Parent agent not found' };
+    }
+    if (parentMetadata.status !== 'running') {
+      return { valid: false, error: 'Parent agent no longer running' };
+    }
+  }
+
+  // All checks passed
+  return { valid: true, token };
+}
+
+// Issue #48: Invalidate a single session token
+function invalidateSessionToken(tokenString: string): boolean {
+  const token = sessionTokens.get(tokenString);
+  if (token) {
+    sessionTokens.delete(tokenString);
+    console.error(`[pinocchio] Invalidated session token for agent: ${token.agentId}`);
+    return true;
+  }
+  return false;
+}
+
+// Issue #48: Invalidate all tokens belonging to a specific agent
+function invalidateTokensForAgent(agentId: string): number {
+  let count = 0;
+  for (const [tokenString, token] of sessionTokens) {
+    if (token.agentId === agentId) {
+      sessionTokens.delete(tokenString);
+      count++;
+    }
+  }
+  if (count > 0) {
+    console.error(`[pinocchio] Invalidated ${count} token(s) for agent: ${agentId}`);
+  }
+  return count;
+}
+
+// Issue #48: Invalidate all tokens in a spawn tree
+// Called when a tree is terminated or when cleanup is needed
+function invalidateTokensForTree(treeId: string): number {
+  let count = 0;
+  for (const [tokenString, token] of sessionTokens) {
+    if (token.treeId === treeId) {
+      sessionTokens.delete(tokenString);
+      count++;
+    }
+  }
+  if (count > 0) {
+    console.error(`[pinocchio] Invalidated ${count} token(s) for tree: ${treeId}`);
+  }
+  return count;
+}
+
+// Issue #48: Clean up expired tokens (called periodically)
+function cleanupExpiredTokens(): number {
+  const now = Date.now();
+  let count = 0;
+  for (const [tokenString, token] of sessionTokens) {
+    if (now > token.expiresAt) {
+      sessionTokens.delete(tokenString);
+      count++;
+    }
+  }
+  if (count > 0) {
+    console.error(`[pinocchio] Cleaned up ${count} expired token(s)`);
+  }
+  return count;
+}
+
+// Issue #48: Save token state to disk
+async function saveTokenState(): Promise<void> {
+  try {
+    const dir = path.dirname(TOKENS_STATE_FILE);
+    await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+
+    // Convert Map to array for serialization
+    const persisted: PersistedSessionToken[] = [];
+    const now = Date.now();
+
+    for (const [, token] of sessionTokens) {
+      // Only persist non-expired tokens
+      if (token.expiresAt > now) {
+        persisted.push({
+          token: token.token,
+          signature: token.signature,
+          agentId: token.agentId,
+          treeId: token.treeId,
+          parentAgentId: token.parentAgentId,
+          depth: token.depth,
+          maxDepth: token.maxDepth,
+          issuedAt: token.issuedAt,
+          expiresAt: token.expiresAt,
+          permissions: { ...token.permissions },
+        });
+      }
+    }
+
+    // Use atomic write pattern (temp file + rename)
+    const tempFile = `${TOKENS_STATE_FILE}.tmp.${process.pid}`;
+    await fs.writeFile(tempFile, JSON.stringify(persisted, null, 2), { mode: 0o600 });
+    await fs.chmod(tempFile, 0o600);
+    await fs.rename(tempFile, TOKENS_STATE_FILE);
+  } catch (error) {
+    console.error(`[pinocchio] Warning: Could not save token state: ${error}`);
+  }
+}
+
+// Issue #48: Load token state from disk on startup
+// Note: Tokens loaded from disk will have invalid signatures since serverSecret
+// is regenerated on restart. This is intentional for security - tokens from
+// previous server instances should not be trusted.
+async function loadTokenState(): Promise<void> {
+  try {
+    const data = await fs.readFile(TOKENS_STATE_FILE, "utf-8");
+    let persisted: PersistedSessionToken[];
+
+    try {
+      persisted = JSON.parse(data);
+    } catch (parseError) {
+      // JSON parse failed - back up corrupted file
+      const backupFile = `${TOKENS_STATE_FILE}.corrupted.${Date.now()}`;
+      console.error(`[pinocchio] Tokens state file corrupted, backing up to: ${backupFile}`);
+      try {
+        await fs.copyFile(TOKENS_STATE_FILE, backupFile);
+        await fs.chmod(backupFile, 0o600);
+      } catch (backupError) {
+        console.error(`[pinocchio] Warning: Could not create backup: ${backupError}`);
+      }
+      console.error(`[pinocchio] Starting with fresh token state due to parse error: ${parseError}`);
+      return;
+    }
+
+    const now = Date.now();
+    let loadedCount = 0;
+    let expiredCount = 0;
+    let invalidSignatureCount = 0;
+
+    for (const item of persisted) {
+      // Skip expired tokens
+      if (item.expiresAt <= now) {
+        expiredCount++;
+        continue;
+      }
+
+      const token: SessionToken = {
+        token: item.token,
+        signature: item.signature,
+        agentId: item.agentId,
+        treeId: item.treeId,
+        parentAgentId: item.parentAgentId,
+        depth: item.depth,
+        maxDepth: item.maxDepth,
+        issuedAt: item.issuedAt,
+        expiresAt: item.expiresAt,
+        permissions: { ...item.permissions },
+      };
+
+      // Verify signature - since serverSecret is regenerated on restart,
+      // all loaded tokens will have invalid signatures. We regenerate
+      // signatures for tokens that belong to still-running agents.
+      // This maintains security while preserving session continuity.
+      const agentMeta = agentMetadata.get(token.agentId);
+      if (agentMeta && agentMeta.status === 'running') {
+        // Re-sign the token with new server secret
+        token.signature = signTokenPayload(token);
+        sessionTokens.set(token.token, token);
+        loadedCount++;
+      } else {
+        // Agent not running, don't restore token
+        invalidSignatureCount++;
+      }
+    }
+
+    if (loadedCount > 0 || expiredCount > 0 || invalidSignatureCount > 0) {
+      console.error(`[pinocchio] Token state loaded: ${loadedCount} restored, ${expiredCount} expired, ${invalidSignatureCount} for non-running agents`);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.error(`[pinocchio] Warning: Could not load token state: ${error}`);
+    }
+  }
+}
+
+// Issue #48: Start periodic token cleanup (every 5 minutes)
+let tokenCleanupInterval: NodeJS.Timeout | null = null;
+
+function startTokenCleanup(): void {
+  if (tokenCleanupInterval) {
+    return; // Already running
+  }
+  tokenCleanupInterval = setInterval(() => {
+    cleanupExpiredTokens();
+  }, 5 * 60 * 1000); // Every 5 minutes
+
+  // Don't prevent Node from exiting
+  tokenCleanupInterval.unref();
+}
+
+function stopTokenCleanup(): void {
+  if (tokenCleanupInterval) {
+    clearInterval(tokenCleanupInterval);
+    tokenCleanupInterval = null;
+  }
+}
 
 // SECURITY FIX #5: Rate limiting configuration to prevent DoS attacks.
 // Limits how many agents can run concurrently and how fast they can be spawned.
@@ -1803,6 +2266,21 @@ async function spawnDockerAgent(args: {
     // Issue #45: Initialize hierarchy tracking fields for root agents
     // Issue #46: Generate treeId for this root agent's spawn tree
     const treeId = `tree-${crypto.randomUUID()}`;
+
+    // Issue #48: Generate session token for this agent
+    // Root agents get tokens that allow them to spawn children (if config permits)
+    const nestedSpawnConfig = getNestedSpawnConfig(config);
+    const agentSessionToken = generateSessionToken(
+      agentId,
+      treeId,
+      undefined,  // No parent for root agent
+      0,          // Root is at depth 0
+      nestedSpawnConfig,
+      timeout_ms,
+      github_access !== "none"  // Inherit GitHub token permission if GitHub access is granted
+    );
+    storeSessionToken(agentSessionToken);
+
     const metadata: AgentMetadata = {
       id: agentId,
       task: sanitizedTask,
@@ -1816,6 +2294,8 @@ async function spawnDockerAgent(args: {
       childAgentIds: [],
       nestingDepth: 0,
       treeId,
+      // Issue #48: Store session token reference
+      sessionToken: agentSessionToken.token,
     };
     agentMetadata.set(agentId, metadata);
 
@@ -1827,6 +2307,9 @@ async function spawnDockerAgent(args: {
 
     // Issue #46: Persist tree state when tree is created
     await saveTreeState();
+
+    // Issue #48: Persist token state when token is created
+    await saveTokenState();
 
     // Start the container
     await container.start();
@@ -1984,12 +2467,21 @@ async function spawnDockerAgent(args: {
       }
     }
 
+    // Issue #48: Invalidate session token for this agent
+    if (metadata.sessionToken) {
+      invalidateSessionToken(metadata.sessionToken);
+    }
+    invalidateTokensForAgent(agentId);
+
     // RELIABILITY FIX #4: Persist state when agent completes
     await saveAgentState();
 
     // Issue #46: Check if the tree should be terminated and persist tree state
     checkAndTerminateTree(metadata.treeId);
     await saveTreeState();
+
+    // Issue #48: Persist token state after invalidation
+    await saveTokenState();
 
     // Clean up container (keep metadata for status queries)
     try {
@@ -2043,6 +2535,12 @@ async function spawnDockerAgent(args: {
     runningAgents.delete(agentId);
     const metadata = agentMetadata.get(agentId);
     if (metadata) {
+      // Issue #48: Invalidate session token for this agent
+      if (metadata.sessionToken) {
+        invalidateSessionToken(metadata.sessionToken);
+      }
+      invalidateTokensForAgent(agentId);
+
       metadata.status = "failed";
       metadata.endedAt = new Date();
       // RELIABILITY FIX #4: Persist state when agent fails
@@ -2051,6 +2549,9 @@ async function spawnDockerAgent(args: {
       // Issue #46: Check if the tree should be terminated and persist tree state
       checkAndTerminateTree(metadata.treeId);
       await saveTreeState();
+
+      // Issue #48: Persist token state after invalidation
+      await saveTokenState();
     }
 
     // SECURITY FIX #8: Clean up token file on error
@@ -2197,12 +2698,21 @@ async function monitorAgent(agentId: string, container: Docker.Container, timeou
       }
     }
 
+    // Issue #48: Invalidate session token for this agent
+    if (metadata.sessionToken) {
+      invalidateSessionToken(metadata.sessionToken);
+    }
+    invalidateTokensForAgent(agentId);
+
     // RELIABILITY FIX #4: Persist state when background agent completes
     await saveAgentState();
 
     // Issue #46: Check if the tree should be terminated and persist tree state
     checkAndTerminateTree(metadata.treeId);
     await saveTreeState();
+
+    // Issue #48: Persist token state after invalidation
+    await saveTokenState();
 
     // SECURITY FIX #8: Clean up token file after container completes
     if (metadata.tokenFilePath) {
@@ -2243,12 +2753,21 @@ async function monitorAgent(agentId: string, container: Docker.Container, timeou
       EventBus.getInstance().emitFailed(agentId, errorMessage, undefined, duration_ms);
     }
 
+    // Issue #48: Invalidate session token for this agent
+    if (metadata.sessionToken) {
+      invalidateSessionToken(metadata.sessionToken);
+    }
+    invalidateTokensForAgent(agentId);
+
     // RELIABILITY FIX #4: Persist state when background agent fails
     await saveAgentState();
 
     // Issue #46: Check if the tree should be terminated and persist tree state
     checkAndTerminateTree(metadata.treeId);
     await saveTreeState();
+
+    // Issue #48: Persist token state after invalidation
+    await saveTokenState();
 
     // SECURITY FIX #8: Clean up token file even on error
     if (metadata.tokenFilePath) {
@@ -2440,11 +2959,21 @@ async function stopDockerAgent(args: { agent_id: string }) {
       metadata.endedAt = new Date();
       metadata.output = (metadata.output || "") + "\n[pinocchio] Agent manually stopped by user";
       duration_ms = metadata.endedAt.getTime() - metadata.startedAt.getTime();
+
+      // Issue #48: Invalidate session token for this agent
+      if (metadata.sessionToken) {
+        invalidateSessionToken(metadata.sessionToken);
+      }
+      invalidateTokensForAgent(agent_id);
+
       await saveAgentState();
 
       // Issue #46: Check if the tree should be terminated and persist tree state
       checkAndTerminateTree(metadata.treeId);
       await saveTreeState();
+
+      // Issue #48: Persist token state after invalidation
+      await saveTokenState();
     }
 
     // AUDIT FIX #9: Log agent stop event
@@ -2990,6 +3519,13 @@ async function main() {
 
   // Issue #46: Load persisted spawn tree state on startup
   await loadTreeState();
+
+  // Issue #48: Load persisted session token state on startup
+  // Note: Tokens are re-signed with new server secret for running agents
+  await loadTokenState();
+
+  // Issue #48: Start periodic token cleanup
+  startTokenCleanup();
 
   // SECURITY FIX #8.1: Clean up any stale token files from previous sessions.
   // This handles cases where the MCP server was killed (SIGKILL) or crashed
