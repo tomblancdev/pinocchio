@@ -34,6 +34,11 @@ import {
   SessionToken,
   TokenValidationResult,
 } from './session/index.js';
+import {
+  terminateWithChildren,
+  terminateTree,
+  CascadeTerminationResult,
+} from './lifecycle/index.js';
 
 // PR #32 FIX: Docker stream demultiplexer
 // Docker multiplexed streams have an 8-byte header per message:
@@ -1126,7 +1131,7 @@ async function createSecureTokenFile(agentId: string, token: string): Promise<st
 // SECURITY FIX #8.1: Added cleanup flag to prevent double cleanup race condition.
 // Multiple code paths can trigger cleanup (foreground completion, background monitor, error handlers).
 // The cleanedTokenFiles Set ensures each file is only deleted once.
-async function cleanupTokenFile(tokenFilePath: string): Promise<void> {
+export async function cleanupTokenFile(tokenFilePath: string): Promise<void> {
   // SECURITY FIX #8.1: Check if already cleaned up to prevent race condition
   if (cleanedTokenFiles.has(tokenFilePath)) {
     return;
@@ -2813,6 +2818,20 @@ async function getAgentStatus(args: { agent_id: string; tail_lines?: number }) {
   };
 }
 
+// Issue #58: Helper function to update agent metadata for cascade termination
+async function updateAgentMetadataForTermination(
+  agentId: string,
+  status: "failed",
+  output: string
+): Promise<void> {
+  const metadata = agentMetadata.get(agentId);
+  if (metadata && metadata.status === "running") {
+    metadata.status = status;
+    metadata.endedAt = new Date();
+    metadata.output = (metadata.output || "") + "\n" + output;
+  }
+}
+
 // Stop a running agent
 async function stopDockerAgent(args: { agent_id: string }) {
   const { agent_id } = args;
@@ -2830,13 +2849,67 @@ async function stopDockerAgent(args: { agent_id: string }) {
   }
 
   try {
+    const metadata = agentMetadata.get(agent_id);
+
+    // Issue #58: Check if this agent has children and use cascade termination
+    if (metadata && metadata.childAgentIds.length > 0) {
+      console.error(`[pinocchio] Agent ${agent_id} has ${metadata.childAgentIds.length} children, using cascade termination`);
+
+      const cascadeResult = await terminateWithChildren(
+        agent_id,
+        "SIGTERM",
+        updateAgentMetadataForTermination,
+        runningAgents
+      );
+
+      // Persist state after cascade termination
+      await saveAgentState();
+
+      // Issue #46: Check if the tree should be terminated
+      checkAndTerminateTree(metadata.treeId);
+      await saveTreeState();
+
+      // Issue #48: Persist token state after invalidation
+      await saveSessionTokenState();
+
+      // AUDIT FIX #9: Log agent stop event with cascade info
+      const duration_ms = metadata.endedAt
+        ? metadata.endedAt.getTime() - metadata.startedAt.getTime()
+        : undefined;
+      await auditLog("agent.stop", {
+        stopped_by: "user",
+        duration_ms,
+        cascade: true,
+        terminated_count: cascadeResult.terminated.length,
+        failed_count: cascadeResult.failed.length,
+      }, agent_id);
+
+      // Build response with cascade information
+      const failedInfo = cascadeResult.failed.length > 0
+        ? `\n\n**Failed to terminate:**\n${cascadeResult.failed.map(f => `- ${f.agentId}: ${f.error}`).join("\n")}`
+        : "";
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `## 🔗 Cascade Termination Complete\n\n` +
+              `**Root Agent:** ${agent_id}\n` +
+              `**Agents Terminated:** ${cascadeResult.terminated.length}\n` +
+              `**Terminated IDs:** ${cascadeResult.terminated.map(id => `\`${id}\``).join(", ")}` +
+              failedInfo,
+          },
+        ],
+      };
+    }
+
+    // No children - use original single-agent termination logic
     const container = docker.getContainer(agent_id);
     await container.stop();
     await container.remove({ force: true });
     runningAgents.delete(agent_id);
 
     // RELIABILITY FIX #4: Update and persist metadata when agent is manually stopped
-    const metadata = agentMetadata.get(agent_id);
     let duration_ms: number | undefined;
     if (metadata && metadata.status === "running") {
       metadata.status = "failed";
