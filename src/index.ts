@@ -250,22 +250,72 @@ async function saveConfig(config: AgentConfig): Promise<void> {
   await fs.chmod(dir, 0o700);
 }
 
+// Issue #47: Upper bounds for nested spawn configuration
+const MAX_NESTING_DEPTH_LIMIT = 10;
+const MAX_AGENTS_PER_TREE_LIMIT = 100;
+
 // Issue #47: Validate nested spawn configuration values
 // Returns error messages for any invalid values, empty array if all valid
 function validateNestedSpawnConfig(config: NestedSpawnConfig): string[] {
   const errors: string[] = [];
 
-  if (config.maxNestingDepth < 1) {
+  if (!Number.isInteger(config.maxNestingDepth)) {
+    errors.push(`maxNestingDepth must be an integer, got ${config.maxNestingDepth}`);
+  } else if (config.maxNestingDepth < 1) {
     errors.push(`maxNestingDepth must be >= 1, got ${config.maxNestingDepth}`);
+  } else if (config.maxNestingDepth > MAX_NESTING_DEPTH_LIMIT) {
+    errors.push(`maxNestingDepth must be <= ${MAX_NESTING_DEPTH_LIMIT}, got ${config.maxNestingDepth}`);
   }
-  if (config.maxAgentsPerTree < 1) {
+
+  if (!Number.isInteger(config.maxAgentsPerTree)) {
+    errors.push(`maxAgentsPerTree must be an integer, got ${config.maxAgentsPerTree}`);
+  } else if (config.maxAgentsPerTree < 1) {
     errors.push(`maxAgentsPerTree must be >= 1, got ${config.maxAgentsPerTree}`);
+  } else if (config.maxAgentsPerTree > MAX_AGENTS_PER_TREE_LIMIT) {
+    errors.push(`maxAgentsPerTree must be <= ${MAX_AGENTS_PER_TREE_LIMIT}, got ${config.maxAgentsPerTree}`);
   }
+
   if (typeof config.enableRecursiveSpawn !== 'boolean') {
     errors.push(`enableRecursiveSpawn must be a boolean`);
   }
 
   return errors;
+}
+
+// Issue #47: Helper to validate a numeric env var as a positive integer within bounds
+function parseEnvVarAsPositiveInt(
+  value: string,
+  envVarName: string,
+  minValue: number,
+  maxValue: number
+): number | null {
+  const parsed = Number(value);
+
+  // Check if it's a valid number
+  if (isNaN(parsed)) {
+    console.warn(`[pinocchio] Warning: ${envVarName}="${value}" is not a valid number, ignoring`);
+    return null;
+  }
+
+  // Check if it's an integer
+  if (!Number.isInteger(parsed)) {
+    console.warn(`[pinocchio] Warning: ${envVarName}=${parsed} must be an integer, ignoring`);
+    return null;
+  }
+
+  // Check minimum bound
+  if (parsed < minValue) {
+    console.warn(`[pinocchio] Warning: ${envVarName}=${parsed} must be >= ${minValue}, ignoring`);
+    return null;
+  }
+
+  // Check maximum bound
+  if (parsed > maxValue) {
+    console.warn(`[pinocchio] Warning: ${envVarName}=${parsed} must be <= ${maxValue}, ignoring`);
+    return null;
+  }
+
+  return parsed;
 }
 
 // Issue #47: Get nested spawn config with environment variable overrides
@@ -283,15 +333,25 @@ function getNestedSpawnConfig(config: AgentConfig): NestedSpawnConfig {
   const envRecursive = process.env.ENABLE_RECURSIVE_SPAWN;
 
   if (envDepth !== undefined) {
-    const parsed = Number(envDepth);
-    if (!isNaN(parsed)) {
+    const parsed = parseEnvVarAsPositiveInt(
+      envDepth,
+      "MAX_NESTING_DEPTH",
+      1,
+      MAX_NESTING_DEPTH_LIMIT
+    );
+    if (parsed !== null) {
       baseConfig.maxNestingDepth = parsed;
     }
   }
 
   if (envAgents !== undefined) {
-    const parsed = Number(envAgents);
-    if (!isNaN(parsed)) {
+    const parsed = parseEnvVarAsPositiveInt(
+      envAgents,
+      "MAX_AGENTS_PER_TREE",
+      1,
+      MAX_AGENTS_PER_TREE_LIMIT
+    );
+    if (parsed !== null) {
       baseConfig.maxAgentsPerTree = parsed;
     }
   }
@@ -299,6 +359,14 @@ function getNestedSpawnConfig(config: AgentConfig): NestedSpawnConfig {
   if (envRecursive !== undefined) {
     // Accept 'true', '1', 'yes' as true, anything else as false
     baseConfig.enableRecursiveSpawn = ['true', '1', 'yes'].includes(envRecursive.toLowerCase());
+  }
+
+  // Validate the final config and log any issues
+  const validationErrors = validateNestedSpawnConfig(baseConfig);
+  if (validationErrors.length > 0) {
+    console.warn(`[pinocchio] Warning: Invalid nested spawn config: ${validationErrors.join("; ")}`);
+    // Return defaults if validation fails
+    return { ...DEFAULT_NESTED_SPAWN_CONFIG };
   }
 
   return baseConfig;
