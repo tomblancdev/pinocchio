@@ -169,7 +169,7 @@ interface AgentStatusResponse {
       "task": "Refactor authentication",
       "workspacePath": "/home/user/project",
       "writablePaths": ["src/"],
-      "startedAt": "2024-01-15T10:30:00Z",
+      "startedAt": "2026-01-15T10:30:00Z",
       "status": "running",
       "parentAgentId": null,
       "childAgentIds": ["agent-def456", "agent-ghi789"],
@@ -181,7 +181,7 @@ interface AgentStatusResponse {
       "task": "Update login component",
       "workspacePath": "/home/user/project",
       "writablePaths": ["src/auth/login.ts"],
-      "startedAt": "2024-01-15T10:31:00Z",
+      "startedAt": "2026-01-15T10:31:00Z",
       "status": "running",
       "parentAgentId": "agent-abc123",
       "childAgentIds": [],
@@ -474,7 +474,7 @@ All WebSocket events include these hierarchy fields:
 
 Subscribe to all events for a spawn tree:
 
-```javascript
+```typescript
 const ws = new WebSocket('ws://localhost:3001');
 
 // Subscribe to specific tree
@@ -500,7 +500,7 @@ ws.send(JSON.stringify({
 
 Retrieve historical events for a tree:
 
-```javascript
+```typescript
 ws.send(JSON.stringify({
   type: 'getBufferedEvents',
   treeId: 'tree-xyz789'
