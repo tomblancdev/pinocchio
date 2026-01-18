@@ -1358,7 +1358,7 @@ The agent runs with full autonomy (YOLO mode) inside a secured container with:
   },
   {
     name: "get_agent_status",
-    description: `Get the status and output of a running or completed agent.
+    description: `Get the status and output of a running or completed agent. Includes hierarchy info (treeId, depth, childAgentIds). Set include_children: true for detailed child agent summaries.
 
 Returns:
 - Current status (running/completed/failed)
