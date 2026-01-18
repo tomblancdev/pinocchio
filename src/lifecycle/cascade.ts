@@ -18,6 +18,7 @@ import {
   invalidateTokensForTree,
   invalidateSessionToken,
 } from "../session/index.js";
+import { eventBus } from "../websocket/events.js";
 
 // Docker client for container operations
 const docker = new Docker();
@@ -34,6 +35,9 @@ export interface CascadeTerminationResult {
   totalProcessed: number;
 }
 
+/** Reason for termination (for event tracking) */
+export type TerminationReason = 'cascade' | 'manual' | 'timeout' | 'orphan_cleanup';
+
 /**
  * Recursively terminate an agent and all its descendants (depth-first).
  *
@@ -44,13 +48,17 @@ export interface CascadeTerminationResult {
  * @param signal - The signal to send (default: 'SIGTERM')
  * @param updateMetadata - Callback to update agent metadata after termination
  * @param runningAgents - Map of running agent containers
+ * @param initiatorAgentId - The agent that initiated the cascade termination (for event tracking)
+ * @param reason - The reason for termination (default: 'cascade')
  * @returns Result containing terminated and failed agent IDs
  */
 export async function terminateWithChildren(
   agentId: string,
   signal: string = "SIGTERM",
   updateMetadata: (agentId: string, status: "failed", output: string) => Promise<void>,
-  runningAgents: Map<string, Docker.Container>
+  runningAgents: Map<string, Docker.Container>,
+  initiatorAgentId?: string,
+  reason: TerminationReason = 'cascade'
 ): Promise<CascadeTerminationResult> {
   const result: CascadeTerminationResult = {
     terminated: [],
@@ -65,8 +73,12 @@ export async function terminateWithChildren(
   }
 
   // Terminate children first (depth-first traversal)
+  // Use the original initiator or this agent if this is the root of the cascade
+  const effectiveInitiator = initiatorAgentId ?? agentId;
+  // Children are terminated due to cascade (even if root was orphan_cleanup)
+  const childReason: TerminationReason = reason === 'orphan_cleanup' ? 'cascade' : reason;
   for (const childId of metadata.childAgentIds) {
-    const childResult = await terminateWithChildren(childId, signal, updateMetadata, runningAgents);
+    const childResult = await terminateWithChildren(childId, signal, updateMetadata, runningAgents, effectiveInitiator, childReason);
     result.terminated.push(...childResult.terminated);
     result.failed.push(...childResult.failed);
     result.totalProcessed += childResult.totalProcessed;
@@ -124,6 +136,19 @@ export async function terminateWithChildren(
 
       // Update metadata
       await updateMetadata(agentId, "failed", "[pinocchio] Agent terminated via cascade termination");
+
+      // Emit terminated event (Issue #65)
+      eventBus.emitTerminated(
+        agentId,
+        reason,
+        {
+          parentAgentId: metadata.parentAgentId,
+          treeId: metadata.treeId,
+          depth: metadata.nestingDepth,
+        },
+        effectiveInitiator
+      );
+
       result.terminated.push(agentId);
       console.error(`[pinocchio] Cascade termination: Terminated agent ${agentId}`);
     } else if (metadata.status === "completed" || metadata.status === "failed") {
