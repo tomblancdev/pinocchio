@@ -23,8 +23,13 @@ import {
   SpawnRequest,
   SpawnResponse,
   SpawnErrorResponse,
+  QuotaErrorResponse,
+  QuotaInfo,
   SpawnHandler,
   TokenValidator,
+  TreeInfoGetter,
+  RunningAgentCounter,
+  QuotaConfigGetter,
   isSpawnRequest,
 } from './types.js';
 import { RingBuffer } from './buffer.js';
@@ -58,6 +63,11 @@ export class PinocchioWebSocket {
   private spawnHandler: SpawnHandler | null = null;
   private tokenValidator: TokenValidator | null = null;
 
+  // Issue #53: Quota enforcement handlers
+  private treeInfoGetter: TreeInfoGetter | null = null;
+  private runningAgentCounter: RunningAgentCounter | null = null;
+  private quotaConfigGetter: QuotaConfigGetter | null = null;
+
   // PR #73: Rate limiting state (IP -> timestamps of recent requests)
   private rateLimitMap: Map<string, number[]> = new Map();
 
@@ -87,6 +97,30 @@ export class PinocchioWebSocket {
   setTokenValidator(validator: TokenValidator): void {
     this.tokenValidator = validator;
     console.error('[pinocchio-ws] Token validator registered');
+  }
+
+  /**
+   * Issue #53: Register the tree info getter for quota enforcement.
+   */
+  setTreeInfoGetter(getter: TreeInfoGetter): void {
+    this.treeInfoGetter = getter;
+    console.error('[pinocchio-ws] Tree info getter registered');
+  }
+
+  /**
+   * Issue #53: Register the running agent counter for quota enforcement.
+   */
+  setRunningAgentCounter(counter: RunningAgentCounter): void {
+    this.runningAgentCounter = counter;
+    console.error('[pinocchio-ws] Running agent counter registered');
+  }
+
+  /**
+   * Issue #53: Register the quota config getter for quota enforcement.
+   */
+  setQuotaConfigGetter(getter: QuotaConfigGetter): void {
+    this.quotaConfigGetter = getter;
+    console.error('[pinocchio-ws] Quota config getter registered');
   }
 
   /**
@@ -540,6 +574,57 @@ export class PinocchioWebSocket {
       return;
     }
 
+    // Issue #53: Depth limit enforcement
+    // Note: This is a stricter check using current depth vs max depth
+    // The canSpawn permission above uses depth < maxDepth, this uses depth >= maxDepth
+    if (validation.token.depth >= validation.token.maxDepth) {
+      console.error(
+        `[pinocchio-ws] Depth limit exceeded for agent ${validation.token.agentId} (depth: ${validation.token.depth}, maxDepth: ${validation.token.maxDepth})`
+      );
+      this.sendJsonResponse(res, 403, {
+        error: 'Maximum nesting depth exceeded',
+        current_depth: validation.token.depth,
+        max_depth: validation.token.maxDepth,
+      } as QuotaErrorResponse);
+      return;
+    }
+
+    // Issue #53: Tree agent quota enforcement
+    if (this.treeInfoGetter && this.quotaConfigGetter) {
+      const tree = this.treeInfoGetter(validation.token.treeId);
+      const quotaConfig = this.quotaConfigGetter();
+
+      if (tree && tree.totalAgents >= quotaConfig.maxAgentsPerTree) {
+        console.error(
+          `[pinocchio-ws] Tree agent quota exceeded for tree ${validation.token.treeId} (count: ${tree.totalAgents}, max: ${quotaConfig.maxAgentsPerTree})`
+        );
+        this.sendJsonResponse(res, 429, {
+          error: 'Maximum agents per tree exceeded',
+          current_count: tree.totalAgents,
+          max_agents: quotaConfig.maxAgentsPerTree,
+        } as QuotaErrorResponse);
+        return;
+      }
+    }
+
+    // Issue #53: Global concurrent agent limit enforcement
+    if (this.runningAgentCounter && this.quotaConfigGetter) {
+      const runningCount = this.runningAgentCounter();
+      const quotaConfig = this.quotaConfigGetter();
+
+      if (runningCount >= quotaConfig.maxConcurrentAgents) {
+        console.error(
+          `[pinocchio-ws] Global concurrent agent limit reached (running: ${runningCount}, max: ${quotaConfig.maxConcurrentAgents})`
+        );
+        this.sendJsonResponse(res, 429, {
+          error: 'Global concurrent agent limit reached',
+          current_count: runningCount,
+          max_agents: quotaConfig.maxConcurrentAgents,
+        } as QuotaErrorResponse);
+        return;
+      }
+    }
+
     // Parse request body
     let body: SpawnRequest;
     try {
@@ -625,6 +710,21 @@ export class PinocchioWebSocket {
       }
 
       if (result.success) {
+        // Issue #53: Calculate quota info for response
+        let quotaInfo: QuotaInfo | undefined;
+        if (this.treeInfoGetter && this.quotaConfigGetter) {
+          const tree = this.treeInfoGetter(validation.token.treeId);
+          const quotaConfig = this.quotaConfigGetter();
+          if (tree) {
+            // After spawn, tree.totalAgents has been incremented
+            // Calculate remaining based on new count
+            quotaInfo = {
+              tree_agents_remaining: Math.max(0, quotaConfig.maxAgentsPerTree - tree.totalAgents),
+              depth_remaining: Math.max(0, validation.token.maxDepth - (validation.token.depth + 1)),
+            };
+          }
+        }
+
         const response: SpawnResponse = {
           agent_id: result.agent_id!,
           status: result.status || 'completed',
@@ -633,6 +733,7 @@ export class PinocchioWebSocket {
           duration_ms: result.duration_ms || Date.now() - startTime,
           files_modified: result.files_modified,
           error: result.status === 'failed' || result.status === 'timeout' ? result.error : undefined,
+          quota_info: quotaInfo,
         };
         this.sendJsonResponse(res, 200, response);
       } else {
