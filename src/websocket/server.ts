@@ -7,8 +7,10 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { createServer, IncomingMessage, ServerResponse, Server } from 'http';
 import { createServer as createHttpsServer } from 'https';
 import { createConnection } from 'net';
-import { unlinkSync, existsSync } from 'fs';
+import { unlinkSync, existsSync, promises as fs } from 'fs';
 import { timingSafeEqual } from 'crypto';
+import * as path from 'path';
+import * as os from 'os';
 import {
   WebSocketConfig,
   AgentEvent,
@@ -56,9 +58,14 @@ export class PinocchioWebSocket {
   private spawnHandler: SpawnHandler | null = null;
   private tokenValidator: TokenValidator | null = null;
 
+  // PR #73: Rate limiting state (IP -> timestamps of recent requests)
+  private rateLimitMap: Map<string, number[]> = new Map();
+
   private readonly HEARTBEAT_INTERVAL = 30000; // 30 seconds
   private readonly CONNECTION_TIMEOUT = 60000; // 60 seconds
   private readonly MAX_REQUEST_BODY_SIZE = 1024 * 1024; // 1MB max request body
+  private readonly RATE_LIMIT_WINDOW_MS = 60000; // 1 minute window
+  private readonly RATE_LIMIT_MAX_REQUESTS = 10; // 10 requests per window
 
   constructor(private config: WebSocketConfig) {
     this.eventBus = EventBus.getInstance(config.bufferSize);
@@ -472,6 +479,24 @@ export class PinocchioWebSocket {
   ): Promise<void> {
     const startTime = Date.now();
 
+    // PR #73 Fix 1: Content-Type validation
+    const contentType = req.headers['content-type'];
+    if (!contentType || !contentType.includes('application/json')) {
+      this.sendJsonResponse(res, 415, {
+        error: 'Unsupported Media Type: Content-Type must be application/json',
+      } as SpawnErrorResponse);
+      return;
+    }
+
+    // PR #73 Fix 4: Rate limiting per IP
+    const clientIp = req.socket.remoteAddress || 'unknown';
+    if (!this.checkRateLimit(clientIp)) {
+      this.sendJsonResponse(res, 429, {
+        error: 'Too Many Requests: rate limit exceeded (10 requests per minute)',
+      } as SpawnErrorResponse);
+      return;
+    }
+
     // Check if handlers are registered
     if (!this.spawnHandler || !this.tokenValidator) {
       console.error('[pinocchio-ws] Spawn endpoint called but handlers not registered');
@@ -530,6 +555,16 @@ export class PinocchioWebSocket {
       return;
     }
 
+    // PR #73 Fix 3: Validate workspace path against allowed workspaces
+    const workspacePath = body.workspace_path || '/workspace';
+    const workspaceValidation = await this.validateWorkspacePath(workspacePath);
+    if (!workspaceValidation.allowed) {
+      this.sendJsonResponse(res, 403, {
+        error: `Forbidden: ${workspaceValidation.reason}`,
+      } as SpawnErrorResponse);
+      return;
+    }
+
     // Calculate effective timeout (capped at parent's remaining time)
     const parentRemaining = validation.token.expiresAt - Date.now();
     const requestedTimeout = body.timeout_ms || 3600000; // Default 1 hour
@@ -582,23 +617,37 @@ export class PinocchioWebSocket {
 
   /**
    * Parse JSON body from incoming request.
+   * PR #73 Fix 2: Added requestEnded flag to prevent data accumulation after rejection
    */
   private parseJsonBody(req: IncomingMessage): Promise<SpawnRequest> {
     return new Promise((resolve, reject) => {
       const chunks: Buffer[] = [];
       let size = 0;
+      let requestEnded = false;
+
+      const rejectRequest = (error: Error) => {
+        if (requestEnded) return;
+        requestEnded = true;
+        req.removeAllListeners('data');
+        req.removeAllListeners('end');
+        req.removeAllListeners('error');
+        reject(error);
+      };
 
       req.on('data', (chunk: Buffer) => {
+        if (requestEnded) return;
         size += chunk.length;
         if (size > this.MAX_REQUEST_BODY_SIZE) {
           req.destroy();
-          reject(new Error('Request body too large'));
+          rejectRequest(new Error('Request body too large'));
           return;
         }
         chunks.push(chunk);
       });
 
       req.on('end', () => {
+        if (requestEnded) return;
+        requestEnded = true;
         try {
           const body = Buffer.concat(chunks).toString('utf-8');
           if (!body.trim()) {
@@ -613,7 +662,7 @@ export class PinocchioWebSocket {
       });
 
       req.on('error', (error) => {
-        reject(error);
+        rejectRequest(error);
       });
     });
   }
@@ -632,5 +681,113 @@ export class PinocchioWebSocket {
       'Content-Length': Buffer.byteLength(body),
     });
     res.end(body);
+  }
+
+  // ============================================================================
+  // PR #73: Helper methods for security fixes
+  // ============================================================================
+
+  /**
+   * PR #73 Fix 4: Check rate limit for an IP address.
+   * Returns true if request is allowed, false if rate limited.
+   */
+  private checkRateLimit(ip: string): boolean {
+    const now = Date.now();
+    const windowStart = now - this.RATE_LIMIT_WINDOW_MS;
+
+    // Get or initialize timestamps for this IP
+    let timestamps = this.rateLimitMap.get(ip) || [];
+
+    // Filter out timestamps outside the window
+    timestamps = timestamps.filter((t) => t > windowStart);
+
+    // Check if rate limit exceeded
+    if (timestamps.length >= this.RATE_LIMIT_MAX_REQUESTS) {
+      return false;
+    }
+
+    // Record this request
+    timestamps.push(now);
+    this.rateLimitMap.set(ip, timestamps);
+
+    return true;
+  }
+
+  /**
+   * PR #73 Fix 3: Validate workspace path against allowed workspaces.
+   * Loads config and checks if the path is in the allowlist.
+   */
+  private async validateWorkspacePath(
+    workspacePath: string
+  ): Promise<{ allowed: boolean; reason?: string }> {
+    const CONFIG_FILE = path.join(
+      os.homedir(),
+      '.config',
+      'pinocchio',
+      'config.json'
+    );
+
+    // Load config
+    let config: { allowedWorkspaces?: string[]; blockedPaths?: string[] };
+    try {
+      const data = await fs.readFile(CONFIG_FILE, 'utf-8');
+      config = JSON.parse(data);
+    } catch {
+      config = { allowedWorkspaces: [], blockedPaths: [] };
+    }
+
+    const allowedWorkspaces = config.allowedWorkspaces || [];
+    const blockedPaths = config.blockedPaths || [
+      '/etc',
+      '/var',
+      '/root',
+      '/boot',
+      '/sys',
+      '/proc',
+      '/dev',
+    ];
+
+    // Resolve workspace path to real path
+    let realPath: string;
+    try {
+      realPath = await fs.realpath(workspacePath);
+    } catch {
+      return {
+        allowed: false,
+        reason: `Workspace path does not exist or is a broken symlink: ${workspacePath}`,
+      };
+    }
+
+    // Check blocked paths
+    for (const blocked of blockedPaths) {
+      if (realPath === blocked || realPath.startsWith(blocked + '/')) {
+        return { allowed: false, reason: `System path "${blocked}" is not allowed` };
+      }
+    }
+
+    // Check allowlist
+    for (const allowed of allowedWorkspaces) {
+      let normalizedAllowed: string;
+      try {
+        normalizedAllowed = await fs.realpath(allowed);
+      } catch {
+        continue; // Skip broken symlinks in allowlist
+      }
+      if (
+        realPath === normalizedAllowed ||
+        realPath.startsWith(normalizedAllowed + '/')
+      ) {
+        return { allowed: true };
+      }
+    }
+
+    const allowedList =
+      allowedWorkspaces.length > 0
+        ? allowedWorkspaces.join(', ')
+        : '(none configured)';
+    return {
+      allowed: false,
+      reason: `Path not in allowlist. Allowed: ${allowedList}. Use 'manage_config' tool to add workspace.`,
+    };
   }
 }
