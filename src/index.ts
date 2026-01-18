@@ -174,6 +174,21 @@ const AGENTS_STATE_FILE = path.join(os.homedir(), ".config", "pinocchio", "agent
 // Issue #46: Persistent spawn tree state file path
 const TREES_STATE_FILE = path.join(os.homedir(), ".config", "pinocchio", "trees.json");
 
+// Issue #47: Nested spawning configuration
+// Controls limits and behavior for agent-spawned agents
+interface NestedSpawnConfig {
+  maxNestingDepth: number;       // Max depth of spawning (default: 2 = parent + child)
+  maxAgentsPerTree: number;      // Max total agents in a spawn tree (default: 10)
+  enableRecursiveSpawn: boolean; // Allow nested spawning at all (default: true)
+}
+
+// Issue #47: Default values for nested spawn configuration
+const DEFAULT_NESTED_SPAWN_CONFIG: NestedSpawnConfig = {
+  maxNestingDepth: 2,
+  maxAgentsPerTree: 10,
+  enableRecursiveSpawn: true,
+};
+
 // Config file structure
 interface AgentConfig {
   allowedWorkspaces: string[];
@@ -186,6 +201,8 @@ interface AgentConfig {
   };
   // WebSocket configuration
   websocket?: WebSocketConfig;
+  // Issue #47: Nested spawning configuration
+  nestedSpawn?: NestedSpawnConfig;
 }
 
 // Default config
@@ -201,6 +218,8 @@ const DEFAULT_CONFIG: AgentConfig = {
     subscriptionPolicy: 'open',
     bufferSize: 1000,
   },
+  // Issue #47: Nested spawn defaults
+  nestedSpawn: DEFAULT_NESTED_SPAWN_CONFIG,
 };
 
 // AUDIT FIX #9: Audit event structure
@@ -232,6 +251,128 @@ async function saveConfig(config: AgentConfig): Promise<void> {
   // Also ensure the directory has 0o700 permissions (owner rwx only).
   await fs.chmod(CONFIG_FILE, 0o600);
   await fs.chmod(dir, 0o700);
+}
+
+// Issue #47: Upper bounds for nested spawn configuration
+const MAX_NESTING_DEPTH_LIMIT = 10;
+const MAX_AGENTS_PER_TREE_LIMIT = 100;
+
+// Issue #47: Validate nested spawn configuration values
+// Returns error messages for any invalid values, empty array if all valid
+function validateNestedSpawnConfig(config: NestedSpawnConfig): string[] {
+  const errors: string[] = [];
+
+  if (!Number.isInteger(config.maxNestingDepth)) {
+    errors.push(`maxNestingDepth must be an integer, got ${config.maxNestingDepth}`);
+  } else if (config.maxNestingDepth < 1) {
+    errors.push(`maxNestingDepth must be >= 1, got ${config.maxNestingDepth}`);
+  } else if (config.maxNestingDepth > MAX_NESTING_DEPTH_LIMIT) {
+    errors.push(`maxNestingDepth must be <= ${MAX_NESTING_DEPTH_LIMIT}, got ${config.maxNestingDepth}`);
+  }
+
+  if (!Number.isInteger(config.maxAgentsPerTree)) {
+    errors.push(`maxAgentsPerTree must be an integer, got ${config.maxAgentsPerTree}`);
+  } else if (config.maxAgentsPerTree < 1) {
+    errors.push(`maxAgentsPerTree must be >= 1, got ${config.maxAgentsPerTree}`);
+  } else if (config.maxAgentsPerTree > MAX_AGENTS_PER_TREE_LIMIT) {
+    errors.push(`maxAgentsPerTree must be <= ${MAX_AGENTS_PER_TREE_LIMIT}, got ${config.maxAgentsPerTree}`);
+  }
+
+  if (typeof config.enableRecursiveSpawn !== 'boolean') {
+    errors.push(`enableRecursiveSpawn must be a boolean`);
+  }
+
+  return errors;
+}
+
+// Issue #47: Helper to validate a numeric env var as a positive integer within bounds
+function parseEnvVarAsPositiveInt(
+  value: string,
+  envVarName: string,
+  minValue: number,
+  maxValue: number
+): number | null {
+  const parsed = Number(value);
+
+  // Check if it's a valid number
+  if (isNaN(parsed)) {
+    console.warn(`[pinocchio] Warning: ${envVarName}="${value}" is not a valid number, ignoring`);
+    return null;
+  }
+
+  // Check if it's an integer
+  if (!Number.isInteger(parsed)) {
+    console.warn(`[pinocchio] Warning: ${envVarName}=${parsed} must be an integer, ignoring`);
+    return null;
+  }
+
+  // Check minimum bound
+  if (parsed < minValue) {
+    console.warn(`[pinocchio] Warning: ${envVarName}=${parsed} must be >= ${minValue}, ignoring`);
+    return null;
+  }
+
+  // Check maximum bound
+  if (parsed > maxValue) {
+    console.warn(`[pinocchio] Warning: ${envVarName}=${parsed} must be <= ${maxValue}, ignoring`);
+    return null;
+  }
+
+  return parsed;
+}
+
+// Issue #47: Get nested spawn config with environment variable overrides
+// Priority: environment variables > config file > defaults
+function getNestedSpawnConfig(config: AgentConfig): NestedSpawnConfig {
+  // Start with defaults, overlay config file values, then env overrides
+  const baseConfig: NestedSpawnConfig = {
+    ...DEFAULT_NESTED_SPAWN_CONFIG,
+    ...(config.nestedSpawn || {}),
+  };
+
+  // Environment variable overrides
+  const envDepth = process.env.MAX_NESTING_DEPTH;
+  const envAgents = process.env.MAX_AGENTS_PER_TREE;
+  const envRecursive = process.env.ENABLE_RECURSIVE_SPAWN;
+
+  if (envDepth !== undefined) {
+    const parsed = parseEnvVarAsPositiveInt(
+      envDepth,
+      "MAX_NESTING_DEPTH",
+      1,
+      MAX_NESTING_DEPTH_LIMIT
+    );
+    if (parsed !== null) {
+      baseConfig.maxNestingDepth = parsed;
+    }
+  }
+
+  if (envAgents !== undefined) {
+    const parsed = parseEnvVarAsPositiveInt(
+      envAgents,
+      "MAX_AGENTS_PER_TREE",
+      1,
+      MAX_AGENTS_PER_TREE_LIMIT
+    );
+    if (parsed !== null) {
+      baseConfig.maxAgentsPerTree = parsed;
+    }
+  }
+
+  if (envRecursive !== undefined) {
+    // Accept 'true', '1', 'yes' as true, anything else as false
+    baseConfig.enableRecursiveSpawn = ['true', '1', 'yes'].includes(envRecursive.toLowerCase());
+  }
+
+  // Validate the final config and log any issues
+  const validationErrors = validateNestedSpawnConfig(baseConfig);
+  if (validationErrors.length > 0) {
+    console.warn(`[pinocchio] Warning: Invalid nested spawn config: ${validationErrors.join("; ")}`);
+    // Return defaults if validation fails
+    return { ...DEFAULT_NESTED_SPAWN_CONFIG };
+  }
+
+  return baseConfig;
 }
 
 // AUDIT FIX #9: In-memory lock to prevent race condition during rotation
@@ -1052,12 +1193,13 @@ Use this to check on background agents or get detailed results.`,
   },
   {
     name: "manage_config",
-    description: `Manage Pinocchio configuration (workspaces, GitHub, settings, audit).
+    description: `Manage Pinocchio configuration (workspaces, GitHub, settings, nested spawning, audit).
 
 **Sections:**
 - workspaces: Manage allowed workspace paths
 - github: Configure GitHub access and credentials
 - settings: View/modify general settings
+- nestedspawn: Configure nested agent spawning limits
 - audit: View audit logs
 
 **Workspace Actions:**
@@ -1075,6 +1217,10 @@ Use this to check on background agents or get detailed results.`,
 
 **Settings Actions:**
 - settings.show: Display all settings
+
+**Nested Spawn Actions:**
+- nestedspawn.show: Display nested spawning configuration
+- nestedspawn.set: Update nested spawn settings (use max_depth, max_agents, enable_recursive params)
 
 **Audit Actions:**
 - audit.recent: View the last 50 audit log entries`,
@@ -1101,6 +1247,19 @@ Use this to check on background agents or get detailed results.`,
           type: "string",
           enum: ["none", "read", "comment", "write", "manage", "admin"],
           description: "Default GitHub access level (for github.set_default)",
+        },
+        // Issue #47: Parameters for nested spawn configuration
+        max_depth: {
+          type: "number",
+          description: "Max nesting depth for spawned agents (for nestedspawn.set)",
+        },
+        max_agents: {
+          type: "number",
+          description: "Max agents per spawn tree (for nestedspawn.set)",
+        },
+        enable_recursive: {
+          type: "boolean",
+          description: "Enable recursive spawning (for nestedspawn.set)",
         },
       },
       required: ["action"],
@@ -1161,6 +1320,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         reason?: string;
         token?: string;
         default_access?: "none" | "read" | "comment" | "write" | "manage" | "admin";
+        // Issue #47: Nested spawn config params
+        max_depth?: number;
+        max_agents?: number;
+        enable_recursive?: boolean;
       });
 
     default:
@@ -2319,8 +2482,12 @@ async function manageConfig(args: {
   reason?: string;
   token?: string;
   default_access?: "none" | "read" | "comment" | "write" | "manage" | "admin";
+  // Issue #47: Nested spawn config params
+  max_depth?: number;
+  max_agents?: number;
+  enable_recursive?: boolean;
 }) {
-  const { action, path: workspacePath, reason, token, default_access } = args;
+  const { action, path: workspacePath, reason, token, default_access, max_depth, max_agents, enable_recursive } = args;
   const config = await loadConfig();
 
   // Parse action into section and subaction
@@ -2535,6 +2702,8 @@ async function manageConfig(args: {
   if (section === "settings" && subaction === "show") {
     const hasGhToken = !!config.github?.token;
     const ghDefault = config.github?.defaultAccess || "none";
+    // Issue #47: Include nested spawn config in settings display
+    const nestedSpawn = getNestedSpawnConfig(config);
 
     return {
       content: [{
@@ -2547,9 +2716,111 @@ async function manageConfig(args: {
           `**🐙 GitHub:**\n` +
           `- Token: ${hasGhToken ? "configured" : "not set"}\n` +
           `- Default access: ${ghDefault}\n\n` +
+          `**🔄 Nested Spawning:**\n` +
+          `- Max depth: ${nestedSpawn.maxNestingDepth}\n` +
+          `- Max agents per tree: ${nestedSpawn.maxAgentsPerTree}\n` +
+          `- Recursive spawn: ${nestedSpawn.enableRecursiveSpawn ? "enabled" : "disabled"}\n\n` +
           `**Config file:** ~/.config/pinocchio/config.json`,
       }],
     };
+  }
+
+  // Issue #47: Handle nested spawn actions
+  if (section === "nestedspawn") {
+    switch (subaction) {
+      case "show": {
+        const nestedSpawn = getNestedSpawnConfig(config);
+        const envOverrides: string[] = [];
+        if (process.env.MAX_NESTING_DEPTH) envOverrides.push("MAX_NESTING_DEPTH");
+        if (process.env.MAX_AGENTS_PER_TREE) envOverrides.push("MAX_AGENTS_PER_TREE");
+        if (process.env.ENABLE_RECURSIVE_SPAWN) envOverrides.push("ENABLE_RECURSIVE_SPAWN");
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: `## 🔄 Nested Spawn Configuration\n\n` +
+              `| Setting | Value | Default |\n` +
+              `|---------|-------|--------|\n` +
+              `| **Max Nesting Depth** | ${nestedSpawn.maxNestingDepth} | ${DEFAULT_NESTED_SPAWN_CONFIG.maxNestingDepth} |\n` +
+              `| **Max Agents Per Tree** | ${nestedSpawn.maxAgentsPerTree} | ${DEFAULT_NESTED_SPAWN_CONFIG.maxAgentsPerTree} |\n` +
+              `| **Recursive Spawn** | ${nestedSpawn.enableRecursiveSpawn ? "enabled" : "disabled"} | ${DEFAULT_NESTED_SPAWN_CONFIG.enableRecursiveSpawn ? "enabled" : "disabled"} |\n\n` +
+              (envOverrides.length > 0
+                ? `**Active Environment Overrides:** ${envOverrides.join(", ")}\n\n`
+                : "") +
+              `**Description:**\n` +
+              `- \`maxNestingDepth\`: Maximum depth of spawning (1 = only direct spawns)\n` +
+              `- \`maxAgentsPerTree\`: Maximum total agents in a single spawn tree\n` +
+              `- \`enableRecursiveSpawn\`: Whether agents can spawn other agents at all`,
+          }],
+        };
+      }
+
+      case "set": {
+        // Validate that at least one parameter is provided
+        if (max_depth === undefined && max_agents === undefined && enable_recursive === undefined) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: `**Error:** At least one parameter is required: max_depth, max_agents, or enable_recursive`,
+            }],
+            isError: true,
+          };
+        }
+
+        // Initialize nestedSpawn in config if not present
+        config.nestedSpawn = config.nestedSpawn || { ...DEFAULT_NESTED_SPAWN_CONFIG };
+
+        // Apply updates
+        const updates: string[] = [];
+        if (max_depth !== undefined) {
+          if (max_depth < 1) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: `**Error:** max_depth must be >= 1, got ${max_depth}`,
+              }],
+              isError: true,
+            };
+          }
+          config.nestedSpawn.maxNestingDepth = max_depth;
+          updates.push(`maxNestingDepth: ${max_depth}`);
+        }
+
+        if (max_agents !== undefined) {
+          if (max_agents < 1) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: `**Error:** max_agents must be >= 1, got ${max_agents}`,
+              }],
+              isError: true,
+            };
+          }
+          config.nestedSpawn.maxAgentsPerTree = max_agents;
+          updates.push(`maxAgentsPerTree: ${max_agents}`);
+        }
+
+        if (enable_recursive !== undefined) {
+          config.nestedSpawn.enableRecursiveSpawn = enable_recursive;
+          updates.push(`enableRecursiveSpawn: ${enable_recursive}`);
+        }
+
+        await saveConfig(config);
+
+        // Audit log the change
+        await auditLog("nestedspawn.set", {
+          updates: updates,
+          new_config: config.nestedSpawn,
+        });
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: `✅ **Nested spawn configuration updated**\n\nChanges:\n${updates.map(u => `- ${u}`).join("\n")}`,
+          }],
+        };
+      }
+    }
   }
 
   // AUDIT FIX #9: Handle audit actions
@@ -2623,6 +2894,7 @@ async function manageConfig(args: {
         `- workspaces.list, workspaces.propose, workspaces.approve, workspaces.reject, workspaces.remove\n` +
         `- github.show, github.set_token, github.remove_token, github.set_default\n` +
         `- settings.show\n` +
+        `- nestedspawn.show, nestedspawn.set\n` +
         `- audit.recent`,
     }],
     isError: true,
