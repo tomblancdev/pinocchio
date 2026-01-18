@@ -171,6 +171,9 @@ const MAX_AUDIT_FILES = 5;
 // Agent metadata is now persisted to disk so it survives MCP server restarts
 const AGENTS_STATE_FILE = path.join(os.homedir(), ".config", "pinocchio", "agents.json");
 
+// Issue #46: Persistent spawn tree state file path
+const TREES_STATE_FILE = path.join(os.homedir(), ".config", "pinocchio", "trees.json");
+
 // Issue #47: Nested spawning configuration
 // Controls limits and behavior for agent-spawned agents
 interface NestedSpawnConfig {
@@ -477,6 +480,16 @@ interface PersistedAgentMetadata {
   treeId?: string;
 }
 
+// Issue #46: Serializable spawn tree for persistence
+interface PersistedSpawnTree {
+  treeId: string;
+  rootAgentId: string;
+  totalAgents: number;
+  maxDepthReached: number;
+  createdAt: string;  // ISO date string
+  status: "active" | "terminated";
+}
+
 // RELIABILITY FIX #4: Load agent state from disk on startup
 // This restores agent metadata so status can be retrieved after MCP server restarts
 // RELIABILITY FIX #4.1: Back up corrupted files for debugging before starting fresh
@@ -596,6 +609,92 @@ async function saveAgentState(): Promise<void> {
   }
 }
 
+// Issue #46: Load spawn tree state from disk on startup
+async function loadTreeState(): Promise<void> {
+  try {
+    const data = await fs.readFile(TREES_STATE_FILE, "utf-8");
+    let persisted: PersistedSpawnTree[];
+
+    try {
+      persisted = JSON.parse(data);
+    } catch (parseError) {
+      // JSON parse failed - back up corrupted file for debugging
+      const backupFile = `${TREES_STATE_FILE}.corrupted.${Date.now()}`;
+      console.error(`[pinocchio] Trees state file corrupted, backing up to: ${backupFile}`);
+      try {
+        await fs.copyFile(TREES_STATE_FILE, backupFile);
+        await fs.chmod(backupFile, 0o600);
+      } catch (backupError) {
+        console.error(`[pinocchio] Warning: Could not create backup: ${backupError}`);
+      }
+      console.error(`[pinocchio] Starting with fresh tree state due to parse error: ${parseError}`);
+      return;
+    }
+
+    const now = new Date();
+    const maxAge = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
+
+    for (const item of persisted) {
+      const createdAt = new Date(item.createdAt);
+
+      // Clean up old trees (older than 24 hours)
+      if (now.getTime() - createdAt.getTime() > maxAge) {
+        console.error(`[pinocchio] Cleaning up old tree metadata: ${item.treeId}`);
+        continue;
+      }
+
+      // Restore tree with Date objects
+      const tree: SpawnTree = {
+        treeId: item.treeId,
+        rootAgentId: item.rootAgentId,
+        totalAgents: item.totalAgents,
+        maxDepthReached: item.maxDepthReached,
+        createdAt,
+        status: item.status,
+      };
+
+      spawnTrees.set(item.treeId, tree);
+    }
+
+    console.error(`[pinocchio] Loaded ${spawnTrees.size} spawn tree(s) from state file`);
+  } catch (error) {
+    // File doesn't exist or is invalid - start fresh
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.error(`[pinocchio] Warning: Could not load tree state: ${error}`);
+    }
+  }
+}
+
+// Issue #46: Save spawn tree state to disk
+// Called when tree state changes (create, update, terminate)
+async function saveTreeState(): Promise<void> {
+  try {
+    const dir = path.dirname(TREES_STATE_FILE);
+    await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+
+    // Convert Map to array with dates as ISO strings
+    const persisted: PersistedSpawnTree[] = [];
+    for (const [, tree] of spawnTrees) {
+      persisted.push({
+        treeId: tree.treeId,
+        rootAgentId: tree.rootAgentId,
+        totalAgents: tree.totalAgents,
+        maxDepthReached: tree.maxDepthReached,
+        createdAt: tree.createdAt.toISOString(),
+        status: tree.status,
+      });
+    }
+
+    // Use atomic write pattern (temp file + rename) to prevent corruption
+    const tempFile = `${TREES_STATE_FILE}.tmp.${process.pid}`;
+    await fs.writeFile(tempFile, JSON.stringify(persisted, null, 2), { mode: 0o600 });
+    await fs.chmod(tempFile, 0o600);
+    await fs.rename(tempFile, TREES_STATE_FILE);
+  } catch (error) {
+    console.error(`[pinocchio] Warning: Could not save tree state: ${error}`);
+  }
+}
+
 // Docker client
 const docker = new Docker();
 
@@ -623,6 +722,96 @@ interface AgentMetadata {
 // Track running agents and their metadata
 const runningAgents = new Map<string, Docker.Container>();
 const agentMetadata = new Map<string, AgentMetadata>();
+
+// Issue #46: SpawnTree tracks an entire hierarchy of spawned agents as a single unit
+interface SpawnTree {
+  treeId: string;                        // Unique tree identifier (matches AgentMetadata.treeId)
+  rootAgentId: string;                   // ID of the root agent that started this tree
+  totalAgents: number;                   // Count of all agents in this tree (root + children)
+  maxDepthReached: number;               // Highest nesting depth used in this tree
+  createdAt: Date;                       // When the tree was created
+  status: "active" | "terminated";       // Tree lifecycle status
+}
+
+// Issue #46: Track all spawn trees
+const spawnTrees = new Map<string, SpawnTree>();
+
+// Issue #46: Create a new spawn tree when a root agent is spawned
+function createSpawnTree(rootAgentId: string, treeId: string): SpawnTree {
+  const tree: SpawnTree = {
+    treeId,
+    rootAgentId,
+    totalAgents: 1,        // Root agent counts as first agent
+    maxDepthReached: 0,    // Root is at depth 0
+    createdAt: new Date(),
+    status: "active",
+  };
+  spawnTrees.set(treeId, tree);
+  console.error(`[pinocchio] Created spawn tree: ${treeId} for root agent: ${rootAgentId}`);
+  return tree;
+}
+
+// Issue #46: Get a spawn tree by ID
+function getSpawnTree(treeId: string): SpawnTree | undefined {
+  return spawnTrees.get(treeId);
+}
+
+// Issue #46: Update tree agent count (delta can be positive or negative)
+async function updateTreeAgentCount(treeId: string, delta: number): Promise<void> {
+  const tree = spawnTrees.get(treeId);
+  if (tree) {
+    tree.totalAgents = Math.max(0, tree.totalAgents + delta);
+    console.error(`[pinocchio] Tree ${treeId} agent count updated to: ${tree.totalAgents}`);
+    await saveTreeState(); // Auto-persist changes
+  }
+}
+
+// Issue #46: Update the maximum depth reached in a tree
+async function updateTreeMaxDepth(treeId: string, depth: number): Promise<void> {
+  const tree = spawnTrees.get(treeId);
+  if (tree && depth > tree.maxDepthReached) {
+    tree.maxDepthReached = depth;
+    console.error(`[pinocchio] Tree ${treeId} max depth updated to: ${tree.maxDepthReached}`);
+    await saveTreeState(); // Auto-persist changes
+  }
+}
+
+// Issue #46: Mark a tree as terminated (all agents finished)
+function terminateSpawnTree(treeId: string): void {
+  const tree = spawnTrees.get(treeId);
+  if (tree && tree.status === "active") {
+    tree.status = "terminated";
+    console.error(`[pinocchio] Spawn tree terminated: ${treeId}`);
+  }
+}
+
+// Issue #46: Get all agents belonging to a specific tree
+function getAgentsByTree(treeId: string): AgentMetadata[] {
+  const agents: AgentMetadata[] = [];
+  for (const [, metadata] of agentMetadata) {
+    if (metadata.treeId === treeId) {
+      agents.push(metadata);
+    }
+  }
+  return agents;
+}
+
+// Issue #46: Check if a tree should be terminated (all agents completed/failed)
+function checkAndTerminateTree(treeId: string): void {
+  const tree = spawnTrees.get(treeId);
+  if (!tree || tree.status === "terminated") {
+    return;
+  }
+
+  const agents = getAgentsByTree(treeId);
+  const allDone = agents.every(a => a.status === "completed" || a.status === "failed");
+
+  // Note: [].every() returns true for empty arrays, so orphaned trees
+  // (trees with no agents due to cleanup timing) will also be terminated
+  if (allDone) {
+    terminateSpawnTree(treeId);
+  }
+}
 
 // WebSocket server instance (initialized in main if enabled)
 let wsServer: PinocchioWebSocket | null = null;
@@ -1612,6 +1801,8 @@ async function spawnDockerAgent(args: {
     // Store metadata
     // SECURITY FIX #8: Include tokenFilePath for cleanup when container stops
     // Issue #45: Initialize hierarchy tracking fields for root agents
+    // Issue #46: Generate treeId for this root agent's spawn tree
+    const treeId = `tree-${crypto.randomUUID()}`;
     const metadata: AgentMetadata = {
       id: agentId,
       task: sanitizedTask,
@@ -1624,12 +1815,18 @@ async function spawnDockerAgent(args: {
       parentAgentId: undefined,
       childAgentIds: [],
       nestingDepth: 0,
-      treeId: `tree-${crypto.randomUUID()}`,
+      treeId,
     };
     agentMetadata.set(agentId, metadata);
 
+    // Issue #46: Create a SpawnTree to track this root agent's hierarchy
+    createSpawnTree(agentId, treeId);
+
     // RELIABILITY FIX #4: Persist state when agent starts
     await saveAgentState();
+
+    // Issue #46: Persist tree state when tree is created
+    await saveTreeState();
 
     // Start the container
     await container.start();
@@ -1790,6 +1987,10 @@ async function spawnDockerAgent(args: {
     // RELIABILITY FIX #4: Persist state when agent completes
     await saveAgentState();
 
+    // Issue #46: Check if the tree should be terminated and persist tree state
+    checkAndTerminateTree(metadata.treeId);
+    await saveTreeState();
+
     // Clean up container (keep metadata for status queries)
     try {
       await container.remove({ force: true });
@@ -1846,6 +2047,10 @@ async function spawnDockerAgent(args: {
       metadata.endedAt = new Date();
       // RELIABILITY FIX #4: Persist state when agent fails
       await saveAgentState();
+
+      // Issue #46: Check if the tree should be terminated and persist tree state
+      checkAndTerminateTree(metadata.treeId);
+      await saveTreeState();
     }
 
     // SECURITY FIX #8: Clean up token file on error
@@ -1995,6 +2200,10 @@ async function monitorAgent(agentId: string, container: Docker.Container, timeou
     // RELIABILITY FIX #4: Persist state when background agent completes
     await saveAgentState();
 
+    // Issue #46: Check if the tree should be terminated and persist tree state
+    checkAndTerminateTree(metadata.treeId);
+    await saveTreeState();
+
     // SECURITY FIX #8: Clean up token file after container completes
     if (metadata.tokenFilePath) {
       await cleanupTokenFile(metadata.tokenFilePath);
@@ -2036,6 +2245,10 @@ async function monitorAgent(agentId: string, container: Docker.Container, timeou
 
     // RELIABILITY FIX #4: Persist state when background agent fails
     await saveAgentState();
+
+    // Issue #46: Check if the tree should be terminated and persist tree state
+    checkAndTerminateTree(metadata.treeId);
+    await saveTreeState();
 
     // SECURITY FIX #8: Clean up token file even on error
     if (metadata.tokenFilePath) {
@@ -2228,6 +2441,10 @@ async function stopDockerAgent(args: { agent_id: string }) {
       metadata.output = (metadata.output || "") + "\n[pinocchio] Agent manually stopped by user";
       duration_ms = metadata.endedAt.getTime() - metadata.startedAt.getTime();
       await saveAgentState();
+
+      // Issue #46: Check if the tree should be terminated and persist tree state
+      checkAndTerminateTree(metadata.treeId);
+      await saveTreeState();
     }
 
     // AUDIT FIX #9: Log agent stop event
@@ -2719,6 +2936,19 @@ async function gracefulShutdown(signal: string): Promise<void> {
   console.error("[pinocchio] Saving agent state before stopping containers...");
   await saveAgentState();
 
+  // Issue #46: Check and terminate all affected trees, then persist tree state
+  const affectedTreeIds = new Set<string>();
+  for (const { agentId } of containersToStop) {
+    const metadata = agentMetadata.get(agentId);
+    if (metadata) {
+      affectedTreeIds.add(metadata.treeId);
+    }
+  }
+  for (const treeId of affectedTreeIds) {
+    checkAndTerminateTree(treeId);
+  }
+  await saveTreeState();
+
   // Now stop all running agent containers (best effort, with timeout)
   if (containersToStop.length > 0) {
     console.error(`[pinocchio] Stopping ${containersToStop.length} container(s)...`);
@@ -2757,6 +2987,9 @@ process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 async function main() {
   // RELIABILITY FIX #4: Load persisted agent state on startup
   await loadAgentState();
+
+  // Issue #46: Load persisted spawn tree state on startup
+  await loadTreeState();
 
   // SECURITY FIX #8.1: Clean up any stale token files from previous sessions.
   // This handles cases where the MCP server was killed (SIGKILL) or crashed
