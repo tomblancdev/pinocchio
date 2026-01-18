@@ -158,14 +158,15 @@ function determineLogLevel(
 function emitLogMessages(
   agentId: string,
   messages: DockerLogMessage[],
-  eventBus: EventBus
+  eventBus: EventBus,
+  hierarchy: { parentAgentId?: string; treeId: string; depth: number }
 ): void {
   for (const msg of messages) {
     // Split by newlines in case multiple lines come in one message
     const lines = msg.content.split('\n').filter(line => line.trim());
     for (const line of lines) {
       const level = determineLogLevel(line, msg.streamType);
-      eventBus.emitLog(agentId, level, line);
+      eventBus.emitLog(agentId, level, line, hierarchy);
     }
   }
 }
@@ -2192,7 +2193,13 @@ async function spawnDockerAgent(args: {
 
     // Emit agent.started event via WebSocket
     if (wsServer) {
-      EventBus.getInstance().emitStarted(agentId, sanitizedTask.slice(0, 500), workspace_path);
+      EventBus.getInstance().emitStarted(
+        agentId,
+        sanitizedTask.slice(0, 500),
+        workspace_path,
+        resolvedWritablePaths,
+        { parentAgentId: metadata.parentAgentId, treeId: metadata.treeId, depth: metadata.nestingDepth }
+      );
     }
 
     // SECURITY FIX #5.1: Record spawn timestamp ONLY after successful container start.
@@ -2256,7 +2263,8 @@ async function spawnDockerAgent(args: {
         foregroundLogStream.on('data', (chunk: Buffer) => {
           if (foregroundDemuxer && eventBus) {
             const messages = foregroundDemuxer.processChunk(chunk);
-            emitLogMessages(agentId, messages, eventBus);
+            const hierarchy = { parentAgentId: metadata.parentAgentId, treeId: metadata.treeId, depth: metadata.nestingDepth };
+            emitLogMessages(agentId, messages, eventBus, hierarchy);
 
             // Process each log line for progress tracking
             for (const msg of messages) {
@@ -2272,6 +2280,7 @@ async function spawnDockerAgent(args: {
               eventBus.emitProgress(
                 agentId,
                 currentProgress,
+                hierarchy,
                 undefined,
                 foregroundProgressTracker.getFilesModified()
               );
@@ -2326,13 +2335,14 @@ async function spawnDockerAgent(args: {
       }, agentId);
 
       // Emit final 100% progress event before completion
+      const hierarchy = { parentAgentId: metadata.parentAgentId, treeId: metadata.treeId, depth: metadata.nestingDepth };
       if (wsServer) {
-        EventBus.getInstance().emitProgress(agentId, 100, undefined, parsed.filesModified);
+        EventBus.getInstance().emitProgress(agentId, 100, hierarchy, undefined, parsed.filesModified);
       }
 
       // Emit agent.completed event via WebSocket
       if (wsServer) {
-        EventBus.getInstance().emitCompleted(agentId, result.StatusCode, duration, parsed.filesModified);
+        EventBus.getInstance().emitCompleted(agentId, result.StatusCode, output, duration, hierarchy, parsed.filesModified);
       }
     } else {
       await auditLog("agent.fail", {
@@ -2342,8 +2352,9 @@ async function spawnDockerAgent(args: {
       }, agentId);
 
       // Emit agent.failed event via WebSocket
+      const hierarchy = { parentAgentId: metadata.parentAgentId, treeId: metadata.treeId, depth: metadata.nestingDepth };
       if (wsServer) {
-        EventBus.getInstance().emitFailed(agentId, 'Non-zero exit code', result.StatusCode, duration);
+        EventBus.getInstance().emitFailed(agentId, 'Non-zero exit code', result.StatusCode, hierarchy, output);
       }
     }
 
@@ -2449,8 +2460,9 @@ async function spawnDockerAgent(args: {
     }, agentId);
 
     // Emit agent.failed event via WebSocket
-    if (wsServer) {
-      EventBus.getInstance().emitFailed(agentId, errorMessage);
+    if (wsServer && metadata) {
+      const hierarchy = { parentAgentId: metadata.parentAgentId, treeId: metadata.treeId, depth: metadata.nestingDepth };
+      EventBus.getInstance().emitFailed(agentId, errorMessage, -1, hierarchy);
     }
 
     return {
@@ -2493,7 +2505,8 @@ async function monitorAgent(agentId: string, container: Docker.Container, timeou
     logStream.on('data', (chunk: Buffer) => {
       if (demuxer && eventBus) {
         const messages = demuxer.processChunk(chunk);
-        emitLogMessages(agentId, messages, eventBus);
+        const hierarchy = { parentAgentId: metadata.parentAgentId, treeId: metadata.treeId, depth: metadata.nestingDepth };
+        emitLogMessages(agentId, messages, eventBus, hierarchy);
 
         // Process each log line for progress tracking
         for (const msg of messages) {
@@ -2509,6 +2522,7 @@ async function monitorAgent(agentId: string, container: Docker.Container, timeou
           eventBus.emitProgress(
             agentId,
             currentProgress,
+            hierarchy,
             undefined,
             progressTracker.getFilesModified()
           );
@@ -2556,13 +2570,14 @@ async function monitorAgent(agentId: string, container: Docker.Container, timeou
       }, agentId);
 
       // Emit final 100% progress event before completion
+      const hierarchy = { parentAgentId: metadata.parentAgentId, treeId: metadata.treeId, depth: metadata.nestingDepth };
       if (wsServer) {
-        EventBus.getInstance().emitProgress(agentId, 100, undefined, parsed.filesModified);
+        EventBus.getInstance().emitProgress(agentId, 100, hierarchy, undefined, parsed.filesModified);
       }
 
       // Emit agent.completed event via WebSocket for background agents
       if (wsServer) {
-        EventBus.getInstance().emitCompleted(agentId, result.StatusCode, duration_ms, parsed.filesModified);
+        EventBus.getInstance().emitCompleted(agentId, result.StatusCode, metadata.output, duration_ms, hierarchy, parsed.filesModified);
       }
     } else {
       await auditLog("agent.fail", {
@@ -2573,8 +2588,9 @@ async function monitorAgent(agentId: string, container: Docker.Container, timeou
       }, agentId);
 
       // Emit agent.failed event via WebSocket for background agents
+      const hierarchy = { parentAgentId: metadata.parentAgentId, treeId: metadata.treeId, depth: metadata.nestingDepth };
       if (wsServer) {
-        EventBus.getInstance().emitFailed(agentId, 'Non-zero exit code', result.StatusCode, duration_ms);
+        EventBus.getInstance().emitFailed(agentId, 'Non-zero exit code', result.StatusCode, hierarchy, metadata.output);
       }
     }
 
@@ -2629,8 +2645,9 @@ async function monitorAgent(agentId: string, container: Docker.Container, timeou
     }, agentId);
 
     // Emit agent.failed event via WebSocket for background agent errors
+    const hierarchy = { parentAgentId: metadata.parentAgentId, treeId: metadata.treeId, depth: metadata.nestingDepth };
     if (wsServer) {
-      EventBus.getInstance().emitFailed(agentId, errorMessage, undefined, duration_ms);
+      EventBus.getInstance().emitFailed(agentId, errorMessage, -1, hierarchy, metadata.output);
     }
 
     // Issue #48: Invalidate session token for this agent

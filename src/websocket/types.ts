@@ -40,12 +40,22 @@ export type AgentEventType =
   | 'agent.log'
   | 'agent.progress'
   | 'agent.completed'
-  | 'agent.failed';
+  | 'agent.failed'
+  | 'agent.terminated';
 
+/**
+ * Base event with hierarchy info
+ * Issue #62: All events include hierarchy fields for parent-child tracking
+ */
 export interface BaseAgentEvent {
   type: AgentEventType;
   agentId: string;
   timestamp: string;
+
+  // Hierarchy fields (Issue #62)
+  parentAgentId?: string;  // undefined for root agents
+  treeId: string;          // Spawn tree identifier
+  depth: number;           // Nesting depth (0 for root)
 }
 
 export interface AgentStartedEvent extends BaseAgentEvent {
@@ -53,6 +63,7 @@ export interface AgentStartedEvent extends BaseAgentEvent {
   data: {
     task: string;
     workspace: string;
+    writablePaths: string[];
   };
 }
 
@@ -78,17 +89,30 @@ export interface AgentCompletedEvent extends BaseAgentEvent {
   type: 'agent.completed';
   data: {
     exitCode: number;
-    duration: number;
-    filesModified: string[];
+    output: string;
+    durationMs: number;
+    filesModified?: string[];
   };
 }
 
 export interface AgentFailedEvent extends BaseAgentEvent {
   type: 'agent.failed';
   data: {
-    exitCode?: number;
+    exitCode: number;
     error: string;
-    duration?: number;
+    output?: string;
+  };
+}
+
+/**
+ * Event emitted when an agent is terminated (Issue #62)
+ * Reasons include cascade termination, manual termination, timeout, or orphan cleanup
+ */
+export interface AgentTerminatedEvent extends BaseAgentEvent {
+  type: 'agent.terminated';
+  data: {
+    reason: 'cascade' | 'manual' | 'timeout' | 'orphan_cleanup';
+    terminatedBy?: string;  // Agent that triggered cascade
   };
 }
 
@@ -97,7 +121,8 @@ export type AgentEvent =
   | AgentLogEvent
   | AgentProgressEvent
   | AgentCompletedEvent
-  | AgentFailedEvent;
+  | AgentFailedEvent
+  | AgentTerminatedEvent;
 
 // ============================================================================
 // Client -> Server Messages
