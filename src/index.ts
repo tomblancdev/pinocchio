@@ -751,6 +751,13 @@ export interface AgentMetadata {
   sessionToken?: string;         // The token string (stored separately in sessionTokens map)
 }
 
+// Issue #64: Child agent summary for get_agent_status response
+export interface ChildAgentSummary {
+  agentId: string;
+  status: string;
+  task: string;  // truncated to 80 chars
+}
+
 // Track running agents and their metadata
 const runningAgents = new Map<string, Docker.Container>();
 const agentMetadata = new Map<string, AgentMetadata>();
@@ -1358,6 +1365,7 @@ Returns:
 - Task progress and logs
 - Files modified (if completed)
 - Duration and resource usage
+- Agent hierarchy info (parent, tree, depth, children)
 
 Use this to check on background agents or get detailed results.`,
     inputSchema: {
@@ -1370,6 +1378,10 @@ Use this to check on background agents or get detailed results.`,
         tail_lines: {
           type: "number",
           description: "Number of log lines to return (default: 100, use 0 for all)",
+        },
+        include_children: {
+          type: "boolean",
+          description: "Include detailed status summaries of child agents (default: false)",
         },
       },
       required: ["agent_id"],
@@ -1508,7 +1520,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return await listDockerAgents();
 
     case "get_agent_status":
-      return await getAgentStatus(args as { agent_id: string; tail_lines?: number });
+      return await getAgentStatus(args as { agent_id: string; tail_lines?: number; include_children?: boolean });
 
     case "stop_docker_agent":
       return await stopDockerAgent(args as { agent_id: string });
@@ -2742,9 +2754,28 @@ function validateAgentId(agentId: string): { valid: boolean; reason?: string } {
   return { valid: true };
 }
 
+// Issue #64: Helper function to get child agent summaries
+function getChildAgentSummaries(childIds: string[]): ChildAgentSummary[] {
+  return childIds.map(childId => {
+    const childMeta = agentMetadata.get(childId);
+    if (!childMeta) {
+      return {
+        agentId: childId,
+        status: "unknown",
+        task: "(metadata not found)",
+      };
+    }
+    return {
+      agentId: childId,
+      status: childMeta.status,
+      task: childMeta.task.slice(0, 80) + (childMeta.task.length > 80 ? "..." : ""),
+    };
+  });
+}
+
 // Get agent status and output
-async function getAgentStatus(args: { agent_id: string; tail_lines?: number }) {
-  const { agent_id, tail_lines = 100 } = args;
+async function getAgentStatus(args: { agent_id: string; tail_lines?: number; include_children?: boolean }) {
+  const { agent_id, tail_lines = 100, include_children = false } = args;
 
   // SECURITY FIX #14: Validate agent_id format before use
   const idValidation = validateAgentId(agent_id);
@@ -2807,17 +2838,26 @@ async function getAgentStatus(args: { agent_id: string; tail_lines?: number }) {
     ? `\n**Files Modified:**\n${parsed.filesModified.map(f => `- ${f}`).join("\n")}\n`
     : "";
 
-  // Issue #49: Build hierarchy info section for nested agents
-  let hierarchySection = "";
-  if (metadata.parentAgentId || metadata.childAgentIds.length > 0 || metadata.nestingDepth > 0) {
-    hierarchySection = `| **Nesting Depth** | ${metadata.nestingDepth} |\n` +
-      `| **Tree ID** | \`${metadata.treeId}\` |\n`;
-    if (metadata.parentAgentId) {
-      hierarchySection += `| **Parent Agent** | \`${metadata.parentAgentId}\` |\n`;
-    }
-    if (metadata.childAgentIds.length > 0) {
-      hierarchySection += `| **Child Agents** | ${metadata.childAgentIds.map(id => `\`${id}\``).join(", ")} |\n`;
-    }
+  // Issue #64: Build hierarchy info section for nested agents (always include these fields)
+  const hierarchySection =
+    `| **Tree ID** | \`${metadata.treeId}\` |\n` +
+    `| **Nesting Depth** | ${metadata.nestingDepth} |\n` +
+    (metadata.parentAgentId ? `| **Parent Agent** | \`${metadata.parentAgentId}\` |\n` : "") +
+    `| **Child Count** | ${metadata.childAgentIds.length} |\n` +
+    (metadata.childAgentIds.length > 0
+      ? `| **Child Agent IDs** | ${metadata.childAgentIds.map(id => `\`${id}\``).join(", ")} |\n`
+      : "");
+
+  // Issue #64: Build child agent summaries section if requested
+  let childSummariesSection = "";
+  if (include_children && metadata.childAgentIds.length > 0) {
+    const childSummaries = getChildAgentSummaries(metadata.childAgentIds);
+    childSummariesSection = "\n**Child Agent Details:**\n" +
+      "| Agent ID | Status | Task |\n" +
+      "|----------|--------|------|\n" +
+      childSummaries.map(child =>
+        `| \`${child.agentId}\` | ${child.status} | ${child.task} |`
+      ).join("\n") + "\n";
   }
 
   return {
@@ -2835,6 +2875,7 @@ async function getAgentStatus(args: { agent_id: string; tail_lines?: number }) {
         hierarchySection +
         `| **Task** | ${metadata.task.slice(0, 80)}${metadata.task.length > 80 ? "..." : ""} |\n` +
         filesSection +
+        childSummariesSection +
         `\n**Output** (last ${tail_lines} lines):\n\`\`\`\n${displayOutput}\n\`\`\``,
     }],
   };
