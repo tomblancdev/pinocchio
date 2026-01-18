@@ -16,7 +16,7 @@ import { glob } from "glob";
 import * as crypto from "crypto";
 import { EventBus } from './websocket/events.js';
 import { PinocchioWebSocket } from './websocket/server.js';
-import { WebSocketConfig } from './websocket/types.js';
+import { WebSocketConfig, SpawnHandlerArgs, SpawnHandlerResult, TokenValidationResult as WsTokenValidationResult } from './websocket/types.js';
 import { ProgressTracker } from './websocket/progress.js';
 
 // PR #32 FIX: Docker stream demultiplexer
@@ -1083,6 +1083,126 @@ function validateSessionToken(tokenString: string): TokenValidationResult {
 
   // All checks passed
   return { valid: true, token };
+}
+
+// Issue #50: Wrapper for validateSessionToken for WebSocket server
+// Converts internal TokenValidationResult to the WebSocket module's format
+function validateSessionTokenForHttp(tokenString: string): WsTokenValidationResult {
+  const result = validateSessionToken(tokenString);
+  if (!result.valid || !result.token) {
+    return { valid: false, error: result.error };
+  }
+  // Map internal token to the websocket module's format (without signature)
+  return {
+    valid: true,
+    token: {
+      agentId: result.token.agentId,
+      treeId: result.token.treeId,
+      parentAgentId: result.token.parentAgentId,
+      depth: result.token.depth,
+      maxDepth: result.token.maxDepth,
+      expiresAt: result.token.expiresAt,
+      permissions: result.token.permissions,
+    },
+  };
+}
+
+// Issue #50: Spawn handler wrapper for WebSocket server
+// Calls spawnDockerAgent and returns structured result for HTTP response
+async function handleSpawnFromHttp(args: SpawnHandlerArgs): Promise<SpawnHandlerResult> {
+  const startTime = Date.now();
+
+  try {
+    // Call spawnDockerAgent with run_in_background: false (blocking)
+    const result = await spawnDockerAgent({
+      task: args.task,
+      workspace_path: args.workspace_path,
+      writable_paths: args.writable_paths,
+      timeout_ms: args.timeout_ms,
+      parent_agent_id: args.parent_agent_id,
+      run_in_background: false, // Always blocking for child spawns
+    });
+
+    // Parse the MCP response format
+    if (result.isError) {
+      // Extract error message from the structured response
+      const errorText = result.content?.[0]?.text || 'Unknown error';
+      // Try to extract a clean error message from the markdown
+      const errorMatch = errorText.match(/\*\*Error:\*\*\s*(.+)/);
+      return {
+        success: false,
+        error: errorMatch ? errorMatch[1] : errorText.slice(0, 500),
+      };
+    }
+
+    // Extract data from successful response
+    const responseText = result.content?.[0]?.text || '';
+
+    // Parse exit code from the table format
+    const exitCodeMatch = responseText.match(/\*\*Exit Code\*\*\s*\|\s*(\d+)/);
+    const exitCode = exitCodeMatch ? parseInt(exitCodeMatch[1], 10) : 0;
+
+    // Parse duration from the table format
+    const durationMatch = responseText.match(/\*\*Duration\*\*\s*\|\s*([^\n|]+)/);
+    let durationMs = Date.now() - startTime;
+    if (durationMatch) {
+      // Parse duration like "45.2s" or "1m 23s"
+      const durationStr = durationMatch[1].trim();
+      const seconds = parseFloat(durationStr.replace(/[ms]/g, '')) || 0;
+      if (durationStr.includes('m')) {
+        const parts = durationStr.match(/(\d+)m\s*(\d+\.?\d*)s/);
+        if (parts) {
+          durationMs = (parseInt(parts[1], 10) * 60 + parseFloat(parts[2])) * 1000;
+        }
+      } else {
+        durationMs = seconds * 1000;
+      }
+    }
+
+    // Parse agent ID from the header
+    const agentIdMatch = responseText.match(/Agent\s+(claude-agent-\w+|[\w-]+)\s+(?:Completed|Failed)/);
+    const agentId = agentIdMatch ? agentIdMatch[1] : 'unknown';
+
+    // Parse files modified section
+    const filesModified: string[] = [];
+    const filesSection = responseText.match(/\*\*Files Modified:\*\*\n((?:- [^\n]+\n?)+)/);
+    if (filesSection) {
+      const fileLines = filesSection[1].split('\n');
+      for (const line of fileLines) {
+        const fileMatch = line.match(/^- (.+)$/);
+        if (fileMatch) {
+          filesModified.push(fileMatch[1].trim());
+        }
+      }
+    }
+
+    // Extract output from the details section
+    let output = '';
+    const outputMatch = responseText.match(/<details><summary>Full Output<\/summary>\n\n```\n([\s\S]*?)```\n<\/details>/);
+    if (outputMatch) {
+      output = outputMatch[1];
+    }
+
+    // Determine status based on exit code
+    const status = exitCode === 0 ? 'completed' : 'failed';
+
+    return {
+      success: true,
+      agent_id: agentId,
+      status,
+      exit_code: exitCode,
+      output,
+      duration_ms: durationMs,
+      files_modified: filesModified.length > 0 ? filesModified : undefined,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[pinocchio] handleSpawnFromHttp error: ${message}`);
+    return {
+      success: false,
+      error: message,
+    };
+  }
 }
 
 // Issue #48: Invalidate a single session token
@@ -3695,6 +3815,10 @@ async function main() {
   if (config.websocket?.enabled) {
     wsServer = new PinocchioWebSocket(config.websocket);
     try {
+      // Issue #50: Register handlers for HTTP spawn endpoint
+      wsServer.setSpawnHandler(handleSpawnFromHttp);
+      wsServer.setTokenValidator(validateSessionTokenForHttp);
+
       wsServer.start();
       console.error('[pinocchio] WebSocket server started on port', config.websocket.port);
     } catch (error) {

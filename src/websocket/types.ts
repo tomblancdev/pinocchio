@@ -215,3 +215,128 @@ export function isAgentEvent(data: unknown): data is AgentEvent {
     typeof event.timestamp === 'string'
   );
 }
+
+// ============================================================================
+// Issue #50: HTTP Spawn Endpoint Types
+// ============================================================================
+
+/**
+ * Request body for POST /api/v1/spawn
+ */
+export interface SpawnRequest {
+  task: string;
+  workspace_path?: string;
+  writable_paths?: string[];
+  timeout_ms?: number;
+}
+
+/**
+ * Successful response from POST /api/v1/spawn
+ */
+export interface SpawnResponse {
+  agent_id: string;
+  status: 'completed' | 'failed';
+  exit_code: number;
+  output: string;
+  duration_ms: number;
+  files_modified?: string[];
+}
+
+/**
+ * Error response from POST /api/v1/spawn
+ */
+export interface SpawnErrorResponse {
+  error: string;
+}
+
+/**
+ * Session token with permissions (simplified view for HTTP handler)
+ */
+export interface SessionTokenInfo {
+  agentId: string;
+  treeId: string;
+  parentAgentId?: string;
+  depth: number;
+  maxDepth: number;
+  expiresAt: number;
+  permissions: {
+    canSpawn: boolean;
+    inheritGitHubToken: boolean;
+  };
+}
+
+/**
+ * Result of session token validation
+ */
+export interface TokenValidationResult {
+  valid: boolean;
+  token?: SessionTokenInfo;
+  error?: string;
+}
+
+/**
+ * Internal spawn arguments passed to the spawn handler
+ */
+export interface SpawnHandlerArgs {
+  task: string;
+  workspace_path: string;
+  writable_paths?: string[];
+  timeout_ms?: number;
+  parent_agent_id: string;
+  // Child spawns are always blocking (background: false)
+}
+
+/**
+ * Result from the spawn handler
+ */
+export interface SpawnHandlerResult {
+  success: boolean;
+  agent_id?: string;
+  status?: 'completed' | 'failed';
+  exit_code?: number;
+  output?: string;
+  duration_ms?: number;
+  files_modified?: string[];
+  error?: string;
+}
+
+/**
+ * Handler function type for spawning agents
+ */
+export type SpawnHandler = (args: SpawnHandlerArgs) => Promise<SpawnHandlerResult>;
+
+/**
+ * Handler function type for validating session tokens
+ */
+export type TokenValidator = (token: string) => TokenValidationResult;
+
+/**
+ * Type guard for SpawnRequest
+ */
+export function isSpawnRequest(data: unknown): data is SpawnRequest {
+  if (typeof data !== 'object' || data === null) return false;
+  const req = data as Record<string, unknown>;
+
+  // task is required and must be a non-empty string
+  if (typeof req.task !== 'string' || req.task.trim().length === 0) {
+    return false;
+  }
+
+  // workspace_path is optional, but if provided must be a string
+  if (req.workspace_path !== undefined && typeof req.workspace_path !== 'string') {
+    return false;
+  }
+
+  // writable_paths is optional, but if provided must be an array of strings
+  if (req.writable_paths !== undefined) {
+    if (!Array.isArray(req.writable_paths)) return false;
+    if (!req.writable_paths.every(p => typeof p === 'string')) return false;
+  }
+
+  // timeout_ms is optional, but if provided must be a positive number
+  if (req.timeout_ms !== undefined) {
+    if (typeof req.timeout_ms !== 'number' || req.timeout_ms <= 0) return false;
+  }
+
+  return true;
+}
