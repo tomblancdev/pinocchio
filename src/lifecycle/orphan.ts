@@ -98,11 +98,15 @@ export async function cleanupOrphanedAgents(
       `[pinocchio] Orphan detection: Cleaning up orphaned agent ${orphan.agentId} (reason: ${orphan.reason})`
     );
 
+    // Pass orphan_cleanup as the reason for the initial orphan,
+    // children will be terminated with 'cascade' reason
     const result = await terminateWithChildren(
       orphan.agentId,
       "SIGTERM",
       updateMetadata,
-      runningAgents
+      runningAgents,
+      undefined, // no initiatorAgentId for orphan cleanup
+      'orphan_cleanup'
     );
     results.push(result);
   }
