@@ -616,20 +616,22 @@ function getSpawnTree(treeId: string): SpawnTree | undefined {
 }
 
 // Issue #46: Update tree agent count (delta can be positive or negative)
-function updateTreeAgentCount(treeId: string, delta: number): void {
+async function updateTreeAgentCount(treeId: string, delta: number): Promise<void> {
   const tree = spawnTrees.get(treeId);
   if (tree) {
     tree.totalAgents = Math.max(0, tree.totalAgents + delta);
     console.error(`[pinocchio] Tree ${treeId} agent count updated to: ${tree.totalAgents}`);
+    await saveTreeState(); // Auto-persist changes
   }
 }
 
 // Issue #46: Update the maximum depth reached in a tree
-function updateTreeMaxDepth(treeId: string, depth: number): void {
+async function updateTreeMaxDepth(treeId: string, depth: number): Promise<void> {
   const tree = spawnTrees.get(treeId);
   if (tree && depth > tree.maxDepthReached) {
     tree.maxDepthReached = depth;
     console.error(`[pinocchio] Tree ${treeId} max depth updated to: ${tree.maxDepthReached}`);
+    await saveTreeState(); // Auto-persist changes
   }
 }
 
@@ -663,7 +665,9 @@ function checkAndTerminateTree(treeId: string): void {
   const agents = getAgentsByTree(treeId);
   const allDone = agents.every(a => a.status === "completed" || a.status === "failed");
 
-  if (allDone && agents.length > 0) {
+  // Note: [].every() returns true for empty arrays, so orphaned trees
+  // (trees with no agents due to cleanup timing) will also be terminated
+  if (allDone) {
     terminateSpawnTree(treeId);
   }
 }
