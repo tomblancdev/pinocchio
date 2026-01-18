@@ -1,6 +1,21 @@
 # Multi-language Claude Agent Image
 # Provides an isolated environment with Claude Code in YOLO mode
 
+# ============================================================================
+# Builder stage - compile spawn proxy TypeScript
+# ============================================================================
+FROM node:20-slim AS builder
+
+# Build spawn proxy
+COPY spawn-proxy/package*.json /build/spawn-proxy/
+WORKDIR /build/spawn-proxy
+RUN npm ci
+COPY spawn-proxy/ /build/spawn-proxy/
+RUN npm run build
+
+# ============================================================================
+# Final stage - runtime environment
+# ============================================================================
 # Pin to specific digest for reproducible builds
 # To update: docker pull ubuntu:24.04 && docker inspect ubuntu:24.04 --format='{{index .RepoDigests 0}}'
 FROM ubuntu:24.04@sha256:7a398144c5a2fa7dbd9362e460779dc6659bd9b19df50f724250c62ca7812eb3
@@ -50,6 +65,15 @@ RUN npm install -g pnpm bun
 
 # Install Claude Code CLI globally
 RUN npm install -g @anthropic-ai/claude-code
+
+# Copy spawn proxy from builder stage
+COPY --from=builder /build/spawn-proxy/dist /opt/pinocchio/spawn-proxy/
+COPY --from=builder /build/spawn-proxy/node_modules /opt/pinocchio/spawn-proxy/node_modules/
+COPY --from=builder /build/spawn-proxy/package.json /opt/pinocchio/spawn-proxy/
+
+# Create spawn proxy launcher script
+RUN echo '#!/bin/sh\nnode /opt/pinocchio/spawn-proxy/index.js "$@"' > /usr/local/bin/spawn-proxy && \
+    chmod +x /usr/local/bin/spawn-proxy
 
 # Create non-root user for security
 RUN useradd -m -s /bin/bash agent && \
