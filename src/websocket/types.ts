@@ -235,11 +235,12 @@ export interface SpawnRequest {
  */
 export interface SpawnResponse {
   agent_id: string;
-  status: 'completed' | 'failed';
+  status: 'completed' | 'failed' | 'timeout';
   exit_code: number;
   output: string;
   duration_ms: number;
   files_modified?: string[];
+  error?: string;
 }
 
 /**
@@ -292,7 +293,7 @@ export interface SpawnHandlerArgs {
 export interface SpawnHandlerResult {
   success: boolean;
   agent_id?: string;
-  status?: 'completed' | 'failed';
+  status?: 'completed' | 'failed' | 'timeout';
   exit_code?: number;
   output?: string;
   duration_ms?: number;

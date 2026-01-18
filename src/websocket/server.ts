@@ -526,10 +526,13 @@ export class PinocchioWebSocket {
       return;
     }
 
+    // Capture token in local constant for use in closures (TypeScript narrowing doesn't persist)
+    const sessionToken = validation.token;
+
     // Check spawn permission
-    if (!validation.token.permissions.canSpawn) {
+    if (!sessionToken.permissions.canSpawn) {
       console.error(
-        `[pinocchio-ws] Spawn permission denied for agent ${validation.token.agentId} (depth: ${validation.token.depth}, maxDepth: ${validation.token.maxDepth})`
+        `[pinocchio-ws] Spawn permission denied for agent ${sessionToken.agentId} (depth: ${sessionToken.depth}, maxDepth: ${sessionToken.maxDepth})`
       );
       this.sendJsonResponse(res, 403, {
         error: 'Spawn permission denied (depth limit reached)',
@@ -566,7 +569,7 @@ export class PinocchioWebSocket {
     }
 
     // Calculate effective timeout (capped at parent's remaining time)
-    const parentRemaining = validation.token.expiresAt - Date.now();
+    const parentRemaining = sessionToken.expiresAt - Date.now();
     const requestedTimeout = body.timeout_ms || 3600000; // Default 1 hour
     const effectiveTimeout = Math.min(requestedTimeout, parentRemaining);
 
@@ -580,8 +583,25 @@ export class PinocchioWebSocket {
     }
 
     console.error(
-      `[pinocchio-ws] Spawn request from agent ${validation.token.agentId}: task="${body.task.slice(0, 50)}..."`
+      `[pinocchio-ws] Spawn request from agent ${sessionToken.agentId}: task="${body.task.slice(0, 50)}..."`
     );
+
+    // Issue #52: Set socket timeout to match child timeout + 5s buffer
+    const socketTimeout = effectiveTimeout + 5000;
+    req.socket.setTimeout(socketTimeout);
+    console.error(
+      `[pinocchio-ws] Socket timeout set to ${socketTimeout}ms (child timeout: ${effectiveTimeout}ms + 5s buffer)`
+    );
+
+    // Issue #52: Track if parent disconnected
+    let parentDisconnected = false;
+    const disconnectHandler = () => {
+      parentDisconnected = true;
+      console.error(
+        `[pinocchio-ws] Parent agent ${sessionToken.agentId} disconnected, child will continue to completion`
+      );
+    };
+    req.on('close', disconnectHandler);
 
     // Call the spawn handler (blocking until child completes)
     try {
@@ -590,8 +610,19 @@ export class PinocchioWebSocket {
         workspace_path: body.workspace_path || '/workspace',
         writable_paths: body.writable_paths,
         timeout_ms: effectiveTimeout,
-        parent_agent_id: validation.token.agentId,
+        parent_agent_id: sessionToken.agentId,
       });
+
+      // Clean up disconnect handler
+      req.off('close', disconnectHandler);
+
+      // Issue #52: If parent disconnected, just log and don't try to send response
+      if (parentDisconnected) {
+        console.error(
+          `[pinocchio-ws] Child agent ${result.agent_id} completed with status ${result.status} but parent disconnected`
+        );
+        return;
+      }
 
       if (result.success) {
         const response: SpawnResponse = {
@@ -601,6 +632,7 @@ export class PinocchioWebSocket {
           output: result.output || '',
           duration_ms: result.duration_ms || Date.now() - startTime,
           files_modified: result.files_modified,
+          error: result.status === 'failed' || result.status === 'timeout' ? result.error : undefined,
         };
         this.sendJsonResponse(res, 200, response);
       } else {
@@ -609,6 +641,17 @@ export class PinocchioWebSocket {
         } as SpawnErrorResponse);
       }
     } catch (error) {
+      // Clean up disconnect handler
+      req.off('close', disconnectHandler);
+
+      // Don't try to send response if parent disconnected
+      if (parentDisconnected) {
+        console.error(
+          `[pinocchio-ws] Spawn handler error but parent disconnected: ${error instanceof Error ? error.message : 'Unknown error'}`
+        );
+        return;
+      }
+
       const message = error instanceof Error ? error.message : 'Internal server error';
       console.error(`[pinocchio-ws] Spawn handler error: ${message}`);
       this.sendJsonResponse(res, 500, { error: message } as SpawnErrorResponse);
