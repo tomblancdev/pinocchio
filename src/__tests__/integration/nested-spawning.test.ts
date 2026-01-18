@@ -27,6 +27,9 @@ import {
 import { MockContainer, MockDocker } from '../helpers/docker-mock.js';
 
 // Mock the external dependencies
+jest.mock('../../session/manager.js');
+jest.mock('../../websocket/events.js');
+
 import * as sessionManager from '../../session/manager.js';
 import { EventBus } from '../../websocket/events.js';
 import type { AgentEvent } from '../../websocket/types.js';
