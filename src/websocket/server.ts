@@ -43,6 +43,7 @@ const ALL_LOG_LEVELS: Set<LogLevel> = new Set(['debug', 'info', 'warn', 'error']
 
 interface ClientState {
   subscriptions: Map<string, Set<LogLevel>>; // agentId -> Set of log levels (all levels if not specified)
+  treeSubscriptions: Map<string, Set<LogLevel>>; // Issue #63: treeId -> Set of log levels
   authenticated: boolean;
   buffer: RingBuffer<AgentEvent>;
   lastPing: number;
@@ -237,6 +238,7 @@ export class PinocchioWebSocket {
   private handleConnection(ws: WebSocket, req: IncomingMessage): void {
     const state: ClientState = {
       subscriptions: new Map(),
+      treeSubscriptions: new Map(), // Issue #63: Tree-level subscriptions
       authenticated: true, // Already authenticated via verifyClient
       buffer: new RingBuffer<AgentEvent>(this.config.bufferSize),
       lastPing: Date.now(),
@@ -291,11 +293,13 @@ export class PinocchioWebSocket {
 
     switch (message.type) {
       case 'subscribe':
-        this.handleSubscribe(ws, state, message.agentId, message.logLevels);
+        // Issue #63: Support treeId subscriptions
+        this.handleSubscribe(ws, state, message.agentId, message.treeId, message.logLevels);
         break;
 
       case 'unsubscribe':
-        this.handleUnsubscribe(ws, state, message.agentId);
+        // Issue #63: Support treeId unsubscriptions
+        this.handleUnsubscribe(ws, state, message.agentId, message.treeId);
         break;
 
       case 'ping':
@@ -307,27 +311,48 @@ export class PinocchioWebSocket {
 
   /**
    * Handle a subscribe request.
+   * Issue #63: Now supports optional treeId for tree-level subscriptions.
    */
   private handleSubscribe(
     ws: WebSocket,
     state: ClientState,
-    agentId: string,
+    agentId?: string,
+    treeId?: string,
     logLevels?: LogLevel[]
   ): void {
-    // Check subscription policy
-    if (this.config.subscriptionPolicy === 'owner-only' && agentId !== '*') {
-      // In owner-only mode, we'd need to track which connection spawned which agent
-      // For now, allow all subscriptions (implementation detail for later)
-    }
-
     // Store subscription with log level filter (default to all levels)
     const levels = new Set(logLevels || ALL_LOG_LEVELS);
-    state.subscriptions.set(agentId, levels);
-    this.send(ws, { type: 'subscribed', agentId });
 
-    // Send buffered events for this agent (filtered by log level)
-    if (agentId !== '*') {
-      const bufferedEvents = this.eventBus.getBufferedEvents(agentId);
+    // Handle agentId subscription
+    if (agentId) {
+      // Check subscription policy
+      if (this.config.subscriptionPolicy === 'owner-only' && agentId !== '*') {
+        // In owner-only mode, we'd need to track which connection spawned which agent
+        // For now, allow all subscriptions (implementation detail for later)
+      }
+
+      state.subscriptions.set(agentId, levels);
+
+      // Send buffered events for this agent (filtered by log level)
+      if (agentId !== '*') {
+        const bufferedEvents = this.eventBus.getBufferedEvents(agentId);
+        for (const event of bufferedEvents) {
+          // Filter log events by level
+          if (event.type === 'agent.log') {
+            const logLevel = (event as AgentLogEvent).data.level;
+            if (!levels.has(logLevel)) continue;
+          }
+          this.send(ws, { type: 'event', event });
+        }
+      }
+    }
+
+    // Issue #63: Handle treeId subscription
+    if (treeId) {
+      state.treeSubscriptions.set(treeId, levels);
+
+      // Send buffered events for this tree (filtered by log level)
+      const bufferedEvents = this.eventBus.getBufferedEventsByTree(treeId);
       for (const event of bufferedEvents) {
         // Filter log events by level
         if (event.type === 'agent.log') {
@@ -337,30 +362,48 @@ export class PinocchioWebSocket {
         this.send(ws, { type: 'event', event });
       }
     }
+
+    // Send subscription confirmation
+    this.send(ws, { type: 'subscribed', agentId, treeId });
   }
 
   /**
    * Handle an unsubscribe request.
+   * Issue #63: Now supports optional treeId for tree-level unsubscriptions.
    */
   private handleUnsubscribe(
     ws: WebSocket,
     state: ClientState,
-    agentId: string
+    agentId?: string,
+    treeId?: string
   ): void {
-    state.subscriptions.delete(agentId);
-    this.send(ws, { type: 'unsubscribed', agentId });
+    if (agentId) {
+      state.subscriptions.delete(agentId);
+    }
+    if (treeId) {
+      state.treeSubscriptions.delete(treeId);
+    }
+    this.send(ws, { type: 'unsubscribed', agentId, treeId });
   }
 
   /**
    * Broadcast an event to all subscribed clients.
+   * Issue #63: Now also checks treeId subscriptions.
    */
   broadcast(event: AgentEvent): void {
     for (const [ws, state] of this.clients) {
-      // Check if client is subscribed to this agent or '*'
-      // Subscription precedence: specific agent subscription takes precedence over wildcard ('*').
-      // If a client has both a subscription for a specific agentId AND a wildcard subscription
-      // with different log levels, only the specific subscription's log levels are used.
-      const levels = state.subscriptions.get(event.agentId) || state.subscriptions.get('*');
+      // Check if client is subscribed to this agent, wildcard ('*'), or the event's treeId
+      // Subscription precedence:
+      // 1. Specific agent subscription takes precedence over wildcard ('*')
+      // 2. Tree subscription provides a way to get all events in a spawn tree
+      // 3. If subscribed via both agent and tree, only one event is sent (no duplicates)
+      let levels = state.subscriptions.get(event.agentId) || state.subscriptions.get('*');
+
+      // Issue #63: Check tree subscription if no agent subscription matched
+      if (!levels && event.treeId) {
+        levels = state.treeSubscriptions.get(event.treeId);
+      }
+
       if (!levels) continue;
 
       // For log events, check level filter
