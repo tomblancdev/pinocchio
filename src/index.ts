@@ -1602,6 +1602,12 @@ The agent runs with full autonomy (YOLO mode) inside a secured container with:
 - manage: Write + milestones, projects, labels (for PM/Scrum)
 - admin: Full access (repo settings, workflows, secrets)`,
         },
+        // Issue #49: Internal parameter for nested spawning
+        // This is used by the HTTP endpoint when agents spawn children, not for direct Claude Code use
+        parent_agent_id: {
+          type: "string",
+          description: "Internal: Parent agent ID for nested spawning. Used by HTTP endpoint when agents spawn children.",
+        },
       },
       required: ["task", "workspace_path"],
     },
@@ -1765,6 +1771,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         writable_patterns?: string[];
         run_in_background?: boolean;
         github_access?: "none" | "read" | "comment" | "write" | "manage" | "admin";
+        // Issue #49: Internal parameter for nested spawning
+        parent_agent_id?: string;
       });
 
     case "list_docker_agents":
@@ -1975,6 +1983,8 @@ async function spawnDockerAgent(args: {
   writable_patterns?: string[];
   run_in_background?: boolean;
   github_access?: "none" | "read" | "comment" | "write" | "manage" | "admin";
+  // Issue #49: Internal parameter for nested spawning
+  parent_agent_id?: string;
 }) {
   // Generate agent ID early so we can use it for reservation
   const agentId = args.container_name || `claude-agent-${uuidv4().slice(0, 8)}`;
@@ -2069,6 +2079,106 @@ async function spawnDockerAgent(args: {
   // Load config for GitHub settings
   const config = await loadConfig();
   const github_access = args.github_access || config.github?.defaultAccess || "none";
+
+  // Issue #49: Load nested spawn configuration early for hierarchy validation
+  const nestedSpawnConfig = getNestedSpawnConfig(config);
+
+  // Issue #49: Handle nested spawning - validate parent agent and spawn constraints
+  let parentMetadata: AgentMetadata | undefined;
+  let parentTreeId: string | undefined;
+  let nestingDepth = 0;
+
+  if (args.parent_agent_id) {
+    // Validate that recursive spawning is enabled
+    if (!nestedSpawnConfig.enableRecursiveSpawn) {
+      pendingReservations.delete(agentId);
+      return {
+        content: [{
+          type: "text" as const,
+          text: `## Nested Spawning Disabled\n\n**Error:** Recursive agent spawning is disabled in configuration.`,
+        }],
+        isError: true,
+      };
+    }
+
+    // Validate parent agent exists
+    parentMetadata = agentMetadata.get(args.parent_agent_id);
+    if (!parentMetadata) {
+      pendingReservations.delete(agentId);
+      await auditLog("spawn.parent_not_found", {
+        requested_agent_id: agentId,
+        parent_agent_id: args.parent_agent_id,
+      });
+      return {
+        content: [{
+          type: "text" as const,
+          text: `## Parent Agent Not Found\n\n**Error:** Parent agent '${args.parent_agent_id}' does not exist.`,
+        }],
+        isError: true,
+      };
+    }
+
+    // Validate parent agent is still running
+    if (parentMetadata.status !== 'running') {
+      pendingReservations.delete(agentId);
+      await auditLog("spawn.parent_not_running", {
+        requested_agent_id: agentId,
+        parent_agent_id: args.parent_agent_id,
+        parent_status: parentMetadata.status,
+      });
+      return {
+        content: [{
+          type: "text" as const,
+          text: `## Parent Agent Not Running\n\n**Error:** Parent agent '${args.parent_agent_id}' is no longer running (status: ${parentMetadata.status}).`,
+        }],
+        isError: true,
+      };
+    }
+
+    // Calculate nesting depth for child
+    nestingDepth = parentMetadata.nestingDepth + 1;
+    parentTreeId = parentMetadata.treeId;
+
+    // Validate depth limit
+    if (nestingDepth > nestedSpawnConfig.maxNestingDepth) {
+      pendingReservations.delete(agentId);
+      await auditLog("spawn.depth_limit_exceeded", {
+        requested_agent_id: agentId,
+        parent_agent_id: args.parent_agent_id,
+        requested_depth: nestingDepth,
+        max_depth: nestedSpawnConfig.maxNestingDepth,
+      });
+      return {
+        content: [{
+          type: "text" as const,
+          text: `## Maximum Nesting Depth Exceeded\n\n**Error:** Cannot spawn child agent at depth ${nestingDepth}. Maximum depth is ${nestedSpawnConfig.maxNestingDepth}.`,
+        }],
+        isError: true,
+      };
+    }
+
+    // Validate tree agent limit
+    const tree = getSpawnTree(parentTreeId);
+    if (tree && tree.totalAgents >= nestedSpawnConfig.maxAgentsPerTree) {
+      pendingReservations.delete(agentId);
+      await auditLog("spawn.tree_limit_exceeded", {
+        requested_agent_id: agentId,
+        parent_agent_id: args.parent_agent_id,
+        tree_id: parentTreeId,
+        current_agents: tree.totalAgents,
+        max_agents: nestedSpawnConfig.maxAgentsPerTree,
+      });
+      return {
+        content: [{
+          type: "text" as const,
+          text: `## Maximum Agents Per Tree Exceeded\n\n**Error:** Cannot spawn child agent. The spawn tree already has ${tree.totalAgents} agents, maximum is ${nestedSpawnConfig.maxAgentsPerTree}.`,
+        }],
+        isError: true,
+      };
+    }
+
+    console.error(`[pinocchio] Nested spawn: parent=${args.parent_agent_id}, tree=${parentTreeId}, depth=${nestingDepth}`);
+  }
 
   // Apply timeout limits: default 1h, max 24h (configurable via env)
   const requestedTimeout = args.timeout_ms ?? CONFIG.defaultTimeout;
@@ -2265,16 +2375,17 @@ async function spawnDockerAgent(args: {
     // SECURITY FIX #8: Include tokenFilePath for cleanup when container stops
     // Issue #45: Initialize hierarchy tracking fields for root agents
     // Issue #46: Generate treeId for this root agent's spawn tree
-    const treeId = `tree-${crypto.randomUUID()}`;
+    // Issue #49: For child agents, inherit the parent's treeId instead of generating a new one
+    const treeId = parentTreeId ?? `tree-${crypto.randomUUID()}`;
 
     // Issue #48: Generate session token for this agent
     // Root agents get tokens that allow them to spawn children (if config permits)
-    const nestedSpawnConfig = getNestedSpawnConfig(config);
+    // Issue #49: Child agents also get tokens, with inherited hierarchy info
     const agentSessionToken = generateSessionToken(
       agentId,
       treeId,
-      undefined,  // No parent for root agent
-      0,          // Root is at depth 0
+      args.parent_agent_id,  // parentAgentId (undefined for root agents)
+      nestingDepth,          // 0 for root, parent.depth + 1 for children
       nestedSpawnConfig,
       timeout_ms,
       github_access !== "none"  // Inherit GitHub token permission if GitHub access is granted
@@ -2289,23 +2400,41 @@ async function spawnDockerAgent(args: {
       startedAt: new Date(),
       status: "running",
       tokenFilePath: tokenFilePath || undefined,
-      // Issue #45: Root agents have no parent, empty children, depth 0, unique tree ID
-      parentAgentId: undefined,
+      // Issue #45/49: Hierarchy tracking - root agents have no parent, depth 0
+      // Child agents inherit parent's treeId and set proper depth
+      parentAgentId: args.parent_agent_id,
       childAgentIds: [],
-      nestingDepth: 0,
+      nestingDepth,
       treeId,
       // Issue #48: Store session token reference
       sessionToken: agentSessionToken.token,
     };
     agentMetadata.set(agentId, metadata);
 
-    // Issue #46: Create a SpawnTree to track this root agent's hierarchy
-    createSpawnTree(agentId, treeId);
+    // Issue #49: For child agents, update parent's childAgentIds and tree agent count
+    if (parentMetadata) {
+      parentMetadata.childAgentIds.push(agentId);
+      console.error(`[pinocchio] Added child ${agentId} to parent ${args.parent_agent_id}'s childAgentIds`);
+
+      // Issue #46: Update tree agent count and max depth
+      await updateTreeAgentCount(treeId, 1);
+      await updateTreeMaxDepth(treeId, nestingDepth);
+
+      // Audit log the nested spawn relationship
+      await auditLog("spawn.nested", {
+        child_agent_id: agentId,
+        tree_id: treeId,
+        nesting_depth: nestingDepth,
+      }, args.parent_agent_id);
+    } else {
+      // Issue #46: Create a SpawnTree to track this root agent's hierarchy
+      createSpawnTree(agentId, treeId);
+    }
 
     // RELIABILITY FIX #4: Persist state when agent starts
     await saveAgentState();
 
-    // Issue #46: Persist tree state when tree is created
+    // Issue #46: Persist tree state when tree is created or updated
     await saveTreeState();
 
     // Issue #48: Persist token state when token is created
@@ -2338,17 +2467,28 @@ async function spawnDockerAgent(args: {
       // Start background monitoring
       monitorAgent(agentId, container, timeout_ms);
 
+      // Issue #49: Build response with optional hierarchy info for nested agents
+      let responseText = `## 🚀 Agent Started (Background)\n\n` +
+        `| Property | Value |\n` +
+        `|----------|-------|\n` +
+        `| **Agent ID** | \`${agentId}\` |\n` +
+        `| **Workspace** | ${workspace_path} |\n` +
+        `| **Access Mode** | ${accessMode} |\n` +
+        `| **Timeout** | ${formatDuration(timeout_ms)} |\n`;
+
+      // Add hierarchy info for nested agents
+      if (args.parent_agent_id) {
+        responseText += `| **Parent Agent** | \`${args.parent_agent_id}\` |\n` +
+          `| **Nesting Depth** | ${nestingDepth} |\n` +
+          `| **Tree ID** | \`${treeId}\` |\n`;
+      }
+
+      responseText += `\nUse \`get_agent_status(agent_id: "${agentId}")\` to check progress.`;
+
       return {
         content: [{
           type: "text" as const,
-          text: `## 🚀 Agent Started (Background)\n\n` +
-            `| Property | Value |\n` +
-            `|----------|-------|\n` +
-            `| **Agent ID** | \`${agentId}\` |\n` +
-            `| **Workspace** | ${workspace_path} |\n` +
-            `| **Access Mode** | ${accessMode} |\n` +
-            `| **Timeout** | ${formatDuration(timeout_ms)} |\n\n` +
-            `Use \`get_agent_status(agent_id: "${agentId}")\` to check progress.`,
+          text: responseText,
         }],
       };
     }
@@ -2910,6 +3050,19 @@ async function getAgentStatus(args: { agent_id: string; tail_lines?: number }) {
     ? `\n**Files Modified:**\n${parsed.filesModified.map(f => `- ${f}`).join("\n")}\n`
     : "";
 
+  // Issue #49: Build hierarchy info section for nested agents
+  let hierarchySection = "";
+  if (metadata.parentAgentId || metadata.childAgentIds.length > 0 || metadata.nestingDepth > 0) {
+    hierarchySection = `| **Nesting Depth** | ${metadata.nestingDepth} |\n` +
+      `| **Tree ID** | \`${metadata.treeId}\` |\n`;
+    if (metadata.parentAgentId) {
+      hierarchySection += `| **Parent Agent** | \`${metadata.parentAgentId}\` |\n`;
+    }
+    if (metadata.childAgentIds.length > 0) {
+      hierarchySection += `| **Child Agents** | ${metadata.childAgentIds.map(id => `\`${id}\``).join(", ")} |\n`;
+    }
+  }
+
   return {
     content: [{
       type: "text" as const,
@@ -2922,6 +3075,7 @@ async function getAgentStatus(args: { agent_id: string; tail_lines?: number }) {
         `| **Exit Code** | ${metadata.exitCode ?? "n/a"} |\n` +
         `| **Workspace** | ${metadata.workspacePath} |\n` +
         `| **Writable Paths** | ${metadata.writablePaths.length} |\n` +
+        hierarchySection +
         `| **Task** | ${metadata.task.slice(0, 80)}${metadata.task.length > 80 ? "..." : ""} |\n` +
         filesSection +
         `\n**Output** (last ${tail_lines} lines):\n\`\`\`\n${displayOutput}\n\`\`\``,
