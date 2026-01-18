@@ -327,6 +327,13 @@ interface PersistedAgentMetadata {
   exitCode?: number;
   endedAt?: string;   // ISO date string
   output?: string;
+
+  // Issue #45: Hierarchy tracking for nested agent spawning
+  // These fields are optional for backwards compatibility with existing state files
+  parentAgentId?: string;
+  childAgentIds?: string[];
+  nestingDepth?: number;
+  treeId?: string;
 }
 
 // RELIABILITY FIX #4: Load agent state from disk on startup
@@ -369,6 +376,8 @@ async function loadAgentState(): Promise<void> {
       }
 
       // Restore metadata with Date objects
+      // Issue #45: Handle backwards compatibility for hierarchy fields
+      // Old state files won't have these fields, so provide sensible defaults
       const metadata: AgentMetadata = {
         id: item.id,
         task: item.task,
@@ -379,6 +388,11 @@ async function loadAgentState(): Promise<void> {
         exitCode: item.exitCode,
         endedAt,
         output: item.output,
+        // Issue #45: Default hierarchy values for backwards compatibility
+        parentAgentId: item.parentAgentId,
+        childAgentIds: item.childAgentIds ?? [],
+        nestingDepth: item.nestingDepth ?? 0,
+        treeId: item.treeId ?? `tree-legacy-${item.id}`,
       };
 
       // If agent was marked as running but server restarted, mark as failed
@@ -422,6 +436,11 @@ async function saveAgentState(): Promise<void> {
         exitCode: metadata.exitCode,
         endedAt: metadata.endedAt?.toISOString(),
         output: metadata.output,
+        // Issue #45: Persist hierarchy tracking fields
+        parentAgentId: metadata.parentAgentId,
+        childAgentIds: metadata.childAgentIds,
+        nestingDepth: metadata.nestingDepth,
+        treeId: metadata.treeId,
       });
     }
 
@@ -452,6 +471,12 @@ interface AgentMetadata {
   output?: string;
   // SECURITY FIX #8: Track token file path for cleanup
   tokenFilePath?: string;
+
+  // Issue #45: Hierarchy tracking for nested agent spawning
+  parentAgentId?: string;        // ID of parent agent (undefined for root)
+  childAgentIds: string[];       // IDs of spawned children
+  nestingDepth: number;          // 0 for root, increments per level
+  treeId: string;                // Unique ID for the entire spawn tree
 }
 
 // Track running agents and their metadata
@@ -1423,6 +1448,7 @@ async function spawnDockerAgent(args: {
 
     // Store metadata
     // SECURITY FIX #8: Include tokenFilePath for cleanup when container stops
+    // Issue #45: Initialize hierarchy tracking fields for root agents
     const metadata: AgentMetadata = {
       id: agentId,
       task: sanitizedTask,
@@ -1431,6 +1457,11 @@ async function spawnDockerAgent(args: {
       startedAt: new Date(),
       status: "running",
       tokenFilePath: tokenFilePath || undefined,
+      // Issue #45: Root agents have no parent, empty children, depth 0, unique tree ID
+      parentAgentId: undefined,
+      childAgentIds: [],
+      nestingDepth: 0,
+      treeId: `tree-${crypto.randomUUID()}`,
     };
     agentMetadata.set(agentId, metadata);
 
