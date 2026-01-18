@@ -14,7 +14,7 @@ import * as path from "path";
 import * as fs from "fs/promises";
 import { glob } from "glob";
 import * as crypto from "crypto";
-import { EventBus } from './websocket/events.js';
+import { EventBus, eventBus } from './websocket/events.js';
 import { PinocchioWebSocket } from './websocket/server.js';
 import { WebSocketConfig, SpawnHandlerArgs, SpawnHandlerResult, TokenValidationResult as WsTokenValidationResult } from './websocket/types.js';
 import { ProgressTracker } from './websocket/progress.js';
@@ -826,6 +826,8 @@ function terminateSpawnTree(treeId: string): void {
     // Issue #48: Invalidate all session tokens for this tree
     // Tokens are no longer valid once a tree is terminated
     invalidateTokensForTree(treeId);
+    // PR #86: Clean up tree buffer to prevent memory leak
+    eventBus.clearTreeBuffer(treeId);
     console.error(`[pinocchio] Spawn tree terminated: ${treeId}`);
   }
 }

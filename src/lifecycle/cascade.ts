@@ -18,6 +18,7 @@ import {
   invalidateTokensForTree,
   invalidateSessionToken,
 } from "../session/index.js";
+import { eventBus } from "../websocket/events.js";
 
 // Docker client for container operations
 const docker = new Docker();
@@ -189,6 +190,9 @@ export async function terminateTree(
   result.terminated = cascadeResult.terminated;
   result.failed = cascadeResult.failed;
   result.totalProcessed = cascadeResult.totalProcessed;
+
+  // PR #86: Clean up tree buffer to prevent memory leak
+  eventBus.clearTreeBuffer(treeId);
 
   console.error(`[pinocchio] Cascade termination: Tree ${treeId} terminated. ` +
     `Terminated: ${result.terminated.length}, Failed: ${result.failed.length}`);
