@@ -1,0 +1,14 @@
+# Build artifacts - these are built in the container
+spawn-proxy/node_modules
+spawn-proxy/dist
+
+# Editor and IDE files
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
