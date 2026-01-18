@@ -132,13 +132,15 @@ export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
 export interface SubscribeMessage {
   type: 'subscribe';
-  agentId: string; // '*' for all agents
+  agentId?: string; // '*' for all agents, optional if treeId is provided
+  treeId?: string;  // Issue #63: Subscribe to all agents in a spawn tree
   logLevels?: LogLevel[]; // Optional filter, defaults to all levels
 }
 
 export interface UnsubscribeMessage {
   type: 'unsubscribe';
-  agentId: string;
+  agentId?: string;
+  treeId?: string;  // Issue #63: Unsubscribe from tree-level subscription
 }
 
 export interface PingMessage {
@@ -153,12 +155,14 @@ export type ClientMessage = SubscribeMessage | UnsubscribeMessage | PingMessage;
 
 export interface SubscribedMessage {
   type: 'subscribed';
-  agentId: string;
+  agentId?: string;
+  treeId?: string;  // Issue #63: Tree-level subscription confirmation
 }
 
 export interface UnsubscribedMessage {
   type: 'unsubscribed';
-  agentId: string;
+  agentId?: string;
+  treeId?: string;  // Issue #63: Tree-level unsubscription confirmation
 }
 
 export interface ErrorMessage {
@@ -215,10 +219,16 @@ export function isClientMessage(data: unknown): data is ClientMessage {
   const msg = data as Record<string, unknown>;
   if (msg.type === 'ping') return true;
   if (msg.type === 'unsubscribe') {
-    return typeof msg.agentId === 'string' && msg.agentId.length > 0;
+    // Issue #63: Must have either agentId or treeId (or both)
+    const hasAgentId = typeof msg.agentId === 'string' && msg.agentId.length > 0;
+    const hasTreeId = typeof msg.treeId === 'string' && msg.treeId.length > 0;
+    return hasAgentId || hasTreeId;
   }
   if (msg.type === 'subscribe') {
-    if (typeof msg.agentId !== 'string' || msg.agentId.length === 0) {
+    // Issue #63: Must have either agentId or treeId (or both)
+    const hasAgentId = typeof msg.agentId === 'string' && msg.agentId.length > 0;
+    const hasTreeId = typeof msg.treeId === 'string' && msg.treeId.length > 0;
+    if (!hasAgentId && !hasTreeId) {
       return false;
     }
     // logLevels is optional, but if provided must be valid

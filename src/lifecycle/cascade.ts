@@ -215,6 +215,9 @@ export async function terminateTree(
   result.failed = cascadeResult.failed;
   result.totalProcessed = cascadeResult.totalProcessed;
 
+  // PR #86: Clean up tree buffer to prevent memory leak
+  eventBus.clearTreeBuffer(treeId);
+
   console.error(`[pinocchio] Cascade termination: Tree ${treeId} terminated. ` +
     `Terminated: ${result.terminated.length}, Failed: ${result.failed.length}`);
 
