@@ -209,6 +209,8 @@ function getTreeWritableDir(treeId: string): string {
 async function createTreeWritableDirs(treeId: string, relativePaths: string[]): Promise<void> {
   const treeDir = getTreeWritableDir(treeId);
   await fs.mkdir(treeDir, { recursive: true, mode: 0o777 });
+  // Explicit chmod to override umask which may have masked the mode
+  await fs.chmod(treeDir, 0o777);
 
   for (const relPath of relativePaths) {
     // Defense-in-depth: reject paths with parent traversal
@@ -218,6 +220,8 @@ async function createTreeWritableDirs(treeId: string, relativePaths: string[]): 
     }
     const fullPath = path.join(treeDir, relPath);
     await fs.mkdir(fullPath, { recursive: true, mode: 0o777 });
+    // Explicit chmod to override umask which may have masked the mode
+    await fs.chmod(fullPath, 0o777);
   }
 }
 
