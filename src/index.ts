@@ -2057,7 +2057,7 @@ async function spawnDockerAgent(args: {
     let taskWithGuidance = sanitizedTask;
     if (hasWritablePaths) {
       const relativePaths = resolvedWritablePaths.map(p => path.relative(workspace_path, p));
-      taskWithGuidance += `\n\n[WRITABLE PATHS: Read from /workspace, write to /writable. Writable paths: ${relativePaths.map(p => '/writable/' + p).join(', ')}. Note: For git operations, work in /writable as /workspace is read-only.]`;
+      taskWithGuidance += `\n\n[WRITABLE PATHS: You can directly modify files in /workspace. Allowed paths: ${relativePaths.map(p => '/workspace/' + p).join(', ')}. The /writable/ directory is also available as scratch space.]`;
     }
 
     console.error(`[pinocchio] Starting agent: ${agentId}`);
@@ -2151,9 +2151,10 @@ async function spawnDockerAgent(args: {
     }
 
     // Build bind mounts
-    // Workspace is mounted read-only by default for security
+    // Workspace is mounted read-only by default, read-write when writable_paths is specified
+    const workspaceMode = hasWritablePaths ? 'rw' : 'ro';
     const binds: string[] = [
-      `${workspace_path}:/workspace:ro`,
+      `${workspace_path}:/workspace:${workspaceMode}`,
       // Mount Claude credentials read-only
       `${CONFIG.hostHomePath}/.claude:/tmp/claude-creds:ro`,
     ];
