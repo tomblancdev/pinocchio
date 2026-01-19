@@ -96,18 +96,16 @@ export class MockContainer {
   }
 
   logs(options?: { follow?: boolean; stdout?: boolean; stderr?: boolean }): Promise<Readable> {
+    const containerState = this.state;
     const stream = new Readable({
       read() {
         // Push all logs
-        for (const log of this.state?.logs || []) {
+        for (const log of containerState?.logs || []) {
           this.push(Buffer.from(log + '\n'));
         }
         this.push(null); // End of stream
       },
     });
-
-    // Bind state to stream context
-    (stream as any).state = this.state;
 
     return Promise.resolve(stream);
   }
