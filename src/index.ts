@@ -1997,6 +1997,10 @@ async function spawnDockerAgent(args: {
   let foregroundLogStream: NodeJS.ReadableStream | null = null;
   let foregroundDemuxer: DockerStreamDemultiplexer | null = null;
 
+  // Issue #90 FIX: Variables declared at function scope for proper cleanup in catch block
+  let treeId: string | null = null;
+  let treeWritableDirsCreated = false;
+
   try {
     // Verify workspace path exists
     const stats = await fs.stat(workspace_path);
@@ -2106,7 +2110,7 @@ async function spawnDockerAgent(args: {
     // Issue #46: Generate treeId for this root agent's spawn tree
     // Issue #49: For child agents, inherit the parent's treeId instead of generating a new one
     // NOTE: Moved before container creation so token can be injected into env vars
-    const treeId = parentTreeId ?? `tree-${crypto.randomUUID()}`;
+    treeId = parentTreeId ?? `tree-${crypto.randomUUID()}`;
 
     // Issue #48: Generate session token for this agent
     // Root agents get tokens that allow them to spawn children (if config permits)
@@ -2154,7 +2158,6 @@ async function spawnDockerAgent(args: {
     }
 
     // Issue #90: Mount writable paths to /writable/{rel-path} with tree isolation
-    let treeWritableDirsCreated = false;
     if (resolvedWritablePaths.length > 0) {
       const relativePaths = resolvedWritablePaths.map(p => path.relative(workspace_path, p));
       await createTreeWritableDirs(treeId, relativePaths);
@@ -2520,7 +2523,7 @@ async function spawnDockerAgent(args: {
     }
 
     // Clean up tree writable dirs if spawn fails
-    if (treeWritableDirsCreated) {
+    if (treeWritableDirsCreated && treeId) {
       await cleanupTreeWritableDir(treeId).catch(() => {});
     }
 
