@@ -2087,6 +2087,8 @@ async function spawnDockerAgent(args: {
       // Inject spawn proxy configuration
       envVars.push(`PINOCCHIO_API_URL=http://mcp-server:3001`);
       envVars.push(`PINOCCHIO_SESSION_TOKEN=${agentSessionToken.token}`);
+      // Pass host workspace path so child agents can be spawned with correct path
+      envVars.push(`PINOCCHIO_HOST_WORKSPACE=${workspace_path}`);
       console.error(`[pinocchio] Injected spawn proxy env vars for agent: ${agentId}`);
     }
 

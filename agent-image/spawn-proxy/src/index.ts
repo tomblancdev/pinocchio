@@ -21,6 +21,7 @@ import {
 // Environment configuration
 const PINOCCHIO_API_URL = process.env.PINOCCHIO_API_URL;
 const PINOCCHIO_SESSION_TOKEN = process.env.PINOCCHIO_SESSION_TOKEN;
+const PINOCCHIO_HOST_WORKSPACE = process.env.PINOCCHIO_HOST_WORKSPACE;
 
 // Validate required environment variables
 if (!PINOCCHIO_API_URL) {
@@ -126,7 +127,8 @@ async function spawnChildAgent(args: SpawnRequest): Promise<{
       },
       body: JSON.stringify({
         task: args.task,
-        workspace_path: args.workspace_path,
+        // Use host workspace path from environment, or fall back to provided path
+        workspace_path: args.workspace_path || PINOCCHIO_HOST_WORKSPACE,
         writable_paths: args.writable_paths,
         timeout_ms: args.timeout_ms,
       }),
