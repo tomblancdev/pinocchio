@@ -1311,6 +1311,50 @@ async function isWorkspaceAllowed(workspacePath: string): Promise<{ allowed: boo
   return { allowed: true };
 }
 
+/**
+ * Validates that a sub-agent's workspace request is within allowed boundaries.
+ * Sub-agents can only access:
+ * 1. The same workspace as their parent (inherits parent's access)
+ * 2. Any path under the tree's /writable/ directory
+ *
+ * @param parentMetadata - The parent agent's metadata
+ * @param requestedWorkspace - The workspace path requested by the sub-agent
+ * @param treeId - The spawn tree ID for writable directory access
+ * @returns Object with allowed boolean and optional reason string
+ */
+function validateSubagentWorkspace(
+  parentMetadata: AgentMetadata,
+  requestedWorkspace: string,
+  treeId: string
+): { allowed: boolean; reason?: string } {
+  // Normalize paths for comparison
+  const normalizedRequested = path.resolve(requestedWorkspace);
+  const normalizedParentWorkspace = path.resolve(parentMetadata.workspacePath);
+  const treeWritableDir = getHostTreeWritableDir(treeId);
+  const normalizedTreeWritable = path.resolve(treeWritableDir);
+
+  // Check if requested workspace is the same as parent's workspace
+  if (normalizedRequested === normalizedParentWorkspace) {
+    return { allowed: true };
+  }
+
+  // Check if requested workspace is under parent's workspace
+  if (normalizedRequested.startsWith(normalizedParentWorkspace + "/")) {
+    return { allowed: true };
+  }
+
+  // Check if requested workspace is under the tree's writable directory
+  if (normalizedRequested === normalizedTreeWritable ||
+      normalizedRequested.startsWith(normalizedTreeWritable + "/")) {
+    return { allowed: true };
+  }
+
+  return {
+    allowed: false,
+    reason: `Sub-agent workspace must be within parent's workspace ('${parentMetadata.workspacePath}') or the tree's writable directory ('${treeWritableDir}'). Requested: '${requestedWorkspace}'`
+  };
+}
+
 // Tool definitions
 const TOOLS = [
   {
@@ -1973,6 +2017,27 @@ async function spawnDockerAgent(args: {
     }
 
     console.error(`[pinocchio] Nested spawn: parent=${args.parent_agent_id}, tree=${parentTreeId}, depth=${nestingDepth}`);
+
+    // Validate sub-agent workspace restriction
+    // Sub-agents can only access: parent's workspace OR tree's writable directory
+    const subagentWorkspaceCheck = validateSubagentWorkspace(parentMetadata, workspace_path, parentTreeId);
+    if (!subagentWorkspaceCheck.allowed) {
+      pendingReservations.delete(agentId);
+      await auditLog("spawn.subagent_workspace_denied", {
+        requested_agent_id: agentId,
+        parent_agent_id: args.parent_agent_id,
+        parent_workspace: parentMetadata.workspacePath,
+        requested_workspace: workspace_path,
+        tree_id: parentTreeId,
+      });
+      return {
+        content: [{
+          type: "text" as const,
+          text: `## Sub-agent Workspace Access Denied\n\n**Error:** ${subagentWorkspaceCheck.reason}`,
+        }],
+        isError: true,
+      };
+    }
   }
 
   // Apply timeout limits: default 1h, max 24h (configurable via env)
