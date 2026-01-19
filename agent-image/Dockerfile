@@ -83,6 +83,10 @@ RUN useradd -m -s /bin/bash agent && \
     mkdir -p /home/agent/.claude && \
     chown agent:agent /home/agent/.claude
 
+# Copy agent environment CLAUDE.md for context
+COPY CLAUDE.md /home/agent/CLAUDE.md
+RUN chown agent:agent /home/agent/CLAUDE.md
+
 # Copy entrypoint script
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
