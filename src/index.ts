@@ -2060,12 +2060,14 @@ async function spawnDockerAgent(args: {
 
     // Issue #90: Inject workspace and writable path guidance into task
     let taskWithGuidance = sanitizedTask;
+    // Always mention /writable/ is available as scratch space
+    taskWithGuidance += `\n\n[SCRATCH SPACE: /writable/ is available for temporary files, builds, and downloads.]`;
     if (args.workspace_writable) {
-      taskWithGuidance += `\n\n[WORKSPACE: Read-write mode. You can directly modify files in /workspace.]`;
+      taskWithGuidance += `\n[WORKSPACE: Read-write mode. You can directly modify files in /workspace.]`;
     }
     if (hasWritablePaths) {
       const relativePaths = resolvedWritablePaths.map(p => path.relative(workspace_path, p));
-      taskWithGuidance += `\n\n[WRITABLE PATHS: Available at /writable/. Paths: ${relativePaths.map(p => '/writable/' + p).join(', ')}]`;
+      taskWithGuidance += `\n[WRITABLE PATHS: Pre-created at ${relativePaths.map(p => '/writable/' + p).join(', ')}]`;
     }
 
     console.error(`[pinocchio] Starting agent: ${agentId}`);
@@ -2178,21 +2180,20 @@ async function spawnDockerAgent(args: {
       binds.push(`${tokenFilePath}:/run/secrets/github_token:ro`);
     }
 
-    // Issue #90: Mount writable paths to /writable/{rel-path} with tree isolation
+    // Issue #90: Always mount /writable/ as tree-isolated scratch space
+    // Create the tree writable root directory
+    await createTreeWritableDirs(treeId, []);
+    treeWritableDirsCreated = true;
+
+    // Mount the tree root to /writable/ - always available as scratch space
+    const hostTreeWritableRoot = getHostTreeWritableDir(treeId);
+    binds.push(`${hostTreeWritableRoot}:/writable:rw`);
+    envVars.push(`PINOCCHIO_WRITABLE_ROOT=/writable`);
+
+    // If specific writable_paths are requested, create those subdirectories
     if (resolvedWritablePaths.length > 0) {
       const relativePaths = resolvedWritablePaths.map(p => path.relative(workspace_path, p));
       await createTreeWritableDirs(treeId, relativePaths);
-      treeWritableDirsCreated = true;
-
-      for (const writablePath of resolvedWritablePaths) {
-        const relativePath = path.relative(workspace_path, writablePath);
-        // Use HOST path for bind mount source (not container's /root path)
-        const hostWritableDir = path.join(getHostTreeWritableDir(treeId), relativePath);
-        const containerPath = path.posix.join("/writable", relativePath);
-        binds.push(`${hostWritableDir}:${containerPath}:rw`);
-      }
-
-      envVars.push(`PINOCCHIO_WRITABLE_ROOT=/writable`);
       envVars.push(`PINOCCHIO_WRITABLE_PATHS=${relativePaths.join(':')}`);
     }
 
@@ -2486,10 +2487,8 @@ async function spawnDockerAgent(args: {
       ? `\n**Files Modified:**\n${parsed.filesModified.map(f => `- ${f}`).join("\n")}\n`
       : "";
 
-    // Build writable directory info for the result
-    const writableDirRow = hasWritablePaths
-      ? `| **Writable Dir** | \`${getHostTreeWritableDir(treeId)}\` |\n`
-      : "";
+    // Build writable directory info for the result (always available now)
+    const writableDirRow = `| **Writable Dir** | \`${getHostTreeWritableDir(treeId)}\` |\n`;
 
     return {
       content: [{
