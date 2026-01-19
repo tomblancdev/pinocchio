@@ -209,7 +209,13 @@ function getTreeWritableDir(treeId: string): string {
 async function createTreeWritableDirs(treeId: string, relativePaths: string[]): Promise<void> {
   const treeDir = getTreeWritableDir(treeId);
   await fs.mkdir(treeDir, { recursive: true, mode: 0o700 });
+
   for (const relPath of relativePaths) {
+    // Defense-in-depth: reject paths with parent traversal
+    if (relPath.includes('..') || path.isAbsolute(relPath)) {
+      console.error(`[pinocchio] Skipping invalid writable path: ${relPath}`);
+      continue;
+    }
     const fullPath = path.join(treeDir, relPath);
     await fs.mkdir(fullPath, { recursive: true, mode: 0o700 });
   }
@@ -2035,7 +2041,7 @@ async function spawnDockerAgent(args: {
     let taskWithGuidance = sanitizedTask;
     if (hasWritablePaths) {
       const relativePaths = resolvedWritablePaths.map(p => path.relative(workspace_path, p));
-      taskWithGuidance += `\n\n[WRITABLE PATHS: Read from /workspace, write to /writable. Writable paths: ${relativePaths.map(p => '/writable/' + p).join(', ')}]`;
+      taskWithGuidance += `\n\n[WRITABLE PATHS: Read from /workspace, write to /writable. Writable paths: ${relativePaths.map(p => '/writable/' + p).join(', ')}. Note: For git operations, work in /writable as /workspace is read-only.]`;
     }
 
     console.error(`[pinocchio] Starting agent: ${agentId}`);
@@ -2148,9 +2154,11 @@ async function spawnDockerAgent(args: {
     }
 
     // Issue #90: Mount writable paths to /writable/{rel-path} with tree isolation
+    let treeWritableDirsCreated = false;
     if (resolvedWritablePaths.length > 0) {
       const relativePaths = resolvedWritablePaths.map(p => path.relative(workspace_path, p));
       await createTreeWritableDirs(treeId, relativePaths);
+      treeWritableDirsCreated = true;
 
       for (const writablePath of resolvedWritablePaths) {
         const relativePath = path.relative(workspace_path, writablePath);
@@ -2509,6 +2517,11 @@ async function spawnDockerAgent(args: {
     // Use the local variable since metadata may not have been set yet
     if (tokenFilePath) {
       await cleanupTokenFile(tokenFilePath);
+    }
+
+    // Clean up tree writable dirs if spawn fails
+    if (treeWritableDirsCreated) {
+      await cleanupTreeWritableDir(treeId).catch(() => {});
     }
 
     const errorMessage = error instanceof Error ? error.message : String(error);
