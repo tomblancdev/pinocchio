@@ -198,12 +198,20 @@ const TREES_STATE_FILE = path.join(os.homedir(), ".config", "pinocchio", "trees.
 
 // Issue #90: Tree-level writable paths directory
 // Each spawn tree gets its own writable directory for isolation
+// Container path (for local filesystem operations inside MCP container)
 const WRITABLE_BASE_DIR = path.join(os.homedir(), ".config", "pinocchio", "writable");
+// Host path (for Docker bind mounts - must use HOST_HOME not os.homedir())
+const HOST_HOME = process.env.HOST_HOME || os.homedir();
+const HOST_WRITABLE_BASE_DIR = path.join(HOST_HOME, ".config", "pinocchio", "writable");
 
 // Issue #90: Helper functions for tree-level writable paths
 
 function getTreeWritableDir(treeId: string): string {
   return path.join(WRITABLE_BASE_DIR, treeId);
+}
+
+function getHostTreeWritableDir(treeId: string): string {
+  return path.join(HOST_WRITABLE_BASE_DIR, treeId);
 }
 
 async function createTreeWritableDirs(treeId: string, relativePaths: string[]): Promise<void> {
@@ -2169,7 +2177,8 @@ async function spawnDockerAgent(args: {
 
       for (const writablePath of resolvedWritablePaths) {
         const relativePath = path.relative(workspace_path, writablePath);
-        const hostWritableDir = path.join(getTreeWritableDir(treeId), relativePath);
+        // Use HOST path for bind mount source (not container's /root path)
+        const hostWritableDir = path.join(getHostTreeWritableDir(treeId), relativePath);
         const containerPath = path.posix.join("/writable", relativePath);
         binds.push(`${hostWritableDir}:${containerPath}:rw`);
       }
