@@ -1320,18 +1320,18 @@ const TOOLS = [
 The agent runs with full autonomy (YOLO mode) inside a secured container with:
 - Read-only access to your Claude Max credentials
 - Configurable network access (disabled by default for security)
-- **Read-only workspace by default** - agent can only read files unless writable paths are specified
+- **Read-only workspace by default** - use workspace_writable: true for direct file modifications
 - Optional Docker access via secure proxy for running tests/builds
 
 **Security Model:**
-- Workspace is mounted READ-ONLY by default
-- Use 'writable_paths' or 'writable_patterns' to allow writing to specific files/folders
-- This ensures agents can only modify what you explicitly allow
+- Workspace (/workspace) is mounted READ-ONLY by default
+- Set 'workspace_writable: true' to allow direct file modifications
+- Use 'writable_paths' for tree-isolated scratch space at /writable/
 
 **Examples:**
-- Review code: no writable paths needed (read-only)
-- Fix a bug: writable_paths: ['src/buggy-file.ts']
-- Run tests: writable_patterns: ['**/*.test.ts', 'coverage/']`,
+- Review code: no options needed (read-only workspace)
+- Fix a bug: workspace_writable: true (direct workspace writes)
+- Isolated work: writable_paths: ['output/'] (scratch space at /writable/output/)`,
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -1371,6 +1371,10 @@ The agent runs with full autonomy (YOLO mode) inside a secured container with:
           type: "array",
           items: { type: "string" },
           description: "Glob patterns (relative to workspace) for writable files. Example: ['src/**/*.ts', '*.md']",
+        },
+        workspace_writable: {
+          type: "boolean",
+          description: "Mount workspace as read-write, allowing agent to directly modify project files. Default: false (read-only workspace).",
         },
         run_in_background: {
           type: "boolean",
@@ -1771,6 +1775,7 @@ async function spawnDockerAgent(args: {
   allow_network?: boolean;
   writable_paths?: string[];
   writable_patterns?: string[];
+  workspace_writable?: boolean;
   run_in_background?: boolean;
   github_access?: "none" | "read" | "comment" | "write" | "manage" | "admin";
   // Issue #49: Internal parameter for nested spawning
@@ -2053,11 +2058,14 @@ async function spawnDockerAgent(args: {
     const hasWritablePaths = resolvedWritablePaths.length > 0;
     const accessMode = hasWritablePaths ? "read-only + specific writes" : "read-only";
 
-    // Issue #90: Inject writable path guidance into task
+    // Issue #90: Inject workspace and writable path guidance into task
     let taskWithGuidance = sanitizedTask;
+    if (args.workspace_writable) {
+      taskWithGuidance += `\n\n[WORKSPACE: Read-write mode. You can directly modify files in /workspace.]`;
+    }
     if (hasWritablePaths) {
       const relativePaths = resolvedWritablePaths.map(p => path.relative(workspace_path, p));
-      taskWithGuidance += `\n\n[WRITABLE PATHS: You can directly modify files in /workspace. Allowed paths: ${relativePaths.map(p => '/workspace/' + p).join(', ')}. The /writable/ directory is also available as scratch space.]`;
+      taskWithGuidance += `\n\n[WRITABLE PATHS: Available at /writable/. Paths: ${relativePaths.map(p => '/writable/' + p).join(', ')}]`;
     }
 
     console.error(`[pinocchio] Starting agent: ${agentId}`);
@@ -2151,8 +2159,8 @@ async function spawnDockerAgent(args: {
     }
 
     // Build bind mounts
-    // Workspace is mounted read-only by default, read-write when writable_paths is specified
-    const workspaceMode = hasWritablePaths ? 'rw' : 'ro';
+    // Workspace is mounted read-only by default, read-write when workspace_writable is true
+    const workspaceMode = args.workspace_writable ? 'rw' : 'ro';
     const binds: string[] = [
       `${workspace_path}:/workspace:${workspaceMode}`,
       // Mount Claude credentials read-only
