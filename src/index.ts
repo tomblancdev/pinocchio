@@ -2045,17 +2045,26 @@ async function spawnDockerAgent(args: {
   const timeout_ms = Math.min(Math.max(requestedTimeout, 1000), CONFIG.absoluteMaxTimeout);
 
   // Validate workspace path against allowlist
-  const workspaceCheck = await isWorkspaceAllowed(workspace_path);
-  if (!workspaceCheck.allowed) {
-    // SECURITY FIX #5.1: Release reservation on early return
-    pendingReservations.delete(agentId);
-    return {
-      content: [{
-        type: "text" as const,
-        text: `## Workspace path not allowed\n\n**Error:** ${workspaceCheck.reason}`,
-      }],
-      isError: true,
-    };
+  // Skip allowlist check for sub-agents using tree writable directory (already validated above)
+  const isSubagentUsingTreeWritable = args.parent_agent_id && parentTreeId && (() => {
+    const normalizedWorkspace = path.resolve(workspace_path);
+    const treeWritableDir = path.resolve(getHostTreeWritableDir(parentTreeId));
+    return normalizedWorkspace === treeWritableDir || normalizedWorkspace.startsWith(treeWritableDir + "/");
+  })();
+
+  if (!isSubagentUsingTreeWritable) {
+    const workspaceCheck = await isWorkspaceAllowed(workspace_path);
+    if (!workspaceCheck.allowed) {
+      // SECURITY FIX #5.1: Release reservation on early return
+      pendingReservations.delete(agentId);
+      return {
+        content: [{
+          type: "text" as const,
+          text: `## Workspace path not allowed\n\n**Error:** ${workspaceCheck.reason}`,
+        }],
+        isError: true,
+      };
+    }
   }
 
   // Sanitize task string
@@ -2218,7 +2227,9 @@ async function spawnDockerAgent(args: {
     if (nestedSpawnConfig.enableRecursiveSpawn &&
         nestingDepth < nestedSpawnConfig.maxNestingDepth) {
       // Inject spawn proxy configuration
-      envVars.push(`PINOCCHIO_API_URL=http://mcp-server:3001`);
+      // Use mcp-server hostname if on docker-proxy network, otherwise use host.docker.internal
+      const apiUrl = allow_docker ? "http://mcp-server:3001" : "http://host.docker.internal:3001";
+      envVars.push(`PINOCCHIO_API_URL=${apiUrl}`);
       envVars.push(`PINOCCHIO_SESSION_TOKEN=${agentSessionToken.token}`);
       // Pass host workspace path so child agents can be spawned with correct path
       envVars.push(`PINOCCHIO_HOST_WORKSPACE=${workspace_path}`);
@@ -2254,6 +2265,7 @@ async function spawnDockerAgent(args: {
     const hostTreeWritableRoot = getHostTreeWritableDir(treeId);
     binds.push(`${hostTreeWritableRoot}:/writable:rw`);
     envVars.push(`PINOCCHIO_WRITABLE_ROOT=/writable`);
+    envVars.push(`PINOCCHIO_HOST_WRITABLE_ROOT=${hostTreeWritableRoot}`);
 
     // If specific writable_paths are requested, create those subdirectories
     if (resolvedWritablePaths.length > 0) {
