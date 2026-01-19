@@ -2477,6 +2477,11 @@ async function spawnDockerAgent(args: {
       ? `\n**Files Modified:**\n${parsed.filesModified.map(f => `- ${f}`).join("\n")}\n`
       : "";
 
+    // Build writable directory info for the result
+    const writableDirRow = hasWritablePaths
+      ? `| **Writable Dir** | \`${getHostTreeWritableDir(treeId)}\` |\n`
+      : "";
+
     return {
       content: [{
         type: "text" as const,
@@ -2487,6 +2492,7 @@ async function spawnDockerAgent(args: {
           `| **Duration** | ${formatDuration(duration)} |\n` +
           `| **Workspace** | ${workspace_path} |\n` +
           `| **Writable Paths** | ${resolvedWritablePaths.length > 0 ? resolvedWritablePaths.length + " paths" : "read-only"} |\n` +
+          writableDirRow +
           filesSection +
           `\n**Summary:**\n${parsed.summary}\n\n` +
           `<details><summary>Full Output</summary>\n\n\`\`\`\n${output}\n\`\`\`\n</details>`,
