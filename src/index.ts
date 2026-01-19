@@ -208,10 +208,10 @@ function getTreeWritableDir(treeId: string): string {
 
 async function createTreeWritableDirs(treeId: string, relativePaths: string[]): Promise<void> {
   const treeDir = getTreeWritableDir(treeId);
-  await fs.mkdir(treeDir, { recursive: true });
+  await fs.mkdir(treeDir, { recursive: true, mode: 0o700 });
   for (const relPath of relativePaths) {
     const fullPath = path.join(treeDir, relPath);
-    await fs.mkdir(fullPath, { recursive: true });
+    await fs.mkdir(fullPath, { recursive: true, mode: 0o700 });
   }
 }
 
