@@ -196,6 +196,35 @@ const AGENTS_STATE_FILE = path.join(os.homedir(), ".config", "pinocchio", "agent
 // Issue #46: Persistent spawn tree state file path
 const TREES_STATE_FILE = path.join(os.homedir(), ".config", "pinocchio", "trees.json");
 
+// Issue #90: Tree-level writable paths directory
+// Each spawn tree gets its own writable directory for isolation
+const WRITABLE_BASE_DIR = path.join(os.homedir(), ".config", "pinocchio", "writable");
+
+// Issue #90: Helper functions for tree-level writable paths
+
+function getTreeWritableDir(treeId: string): string {
+  return path.join(WRITABLE_BASE_DIR, treeId);
+}
+
+async function createTreeWritableDirs(treeId: string, relativePaths: string[]): Promise<void> {
+  const treeDir = getTreeWritableDir(treeId);
+  await fs.mkdir(treeDir, { recursive: true });
+  for (const relPath of relativePaths) {
+    const fullPath = path.join(treeDir, relPath);
+    await fs.mkdir(fullPath, { recursive: true });
+  }
+}
+
+export async function cleanupTreeWritableDir(treeId: string): Promise<void> {
+  const treeDir = getTreeWritableDir(treeId);
+  try {
+    await fs.rm(treeDir, { recursive: true, force: true });
+    console.error(`[pinocchio] Cleaned up writable directory for tree: ${treeId}`);
+  } catch (error) {
+    console.error(`[pinocchio] Failed to cleanup writable dir for tree ${treeId}:`, error);
+  }
+}
+
 // Issue #47: Nested spawning configuration
 // Controls limits and behavior for agent-spawned agents
 export interface NestedSpawnConfig {
@@ -2002,6 +2031,13 @@ async function spawnDockerAgent(args: {
     const hasWritablePaths = resolvedWritablePaths.length > 0;
     const accessMode = hasWritablePaths ? "read-only + specific writes" : "read-only";
 
+    // Issue #90: Inject writable path guidance into task
+    let taskWithGuidance = sanitizedTask;
+    if (hasWritablePaths) {
+      const relativePaths = resolvedWritablePaths.map(p => path.relative(workspace_path, p));
+      taskWithGuidance += `\n\n[WRITABLE PATHS: Read from /workspace, write to /writable. Writable paths: ${relativePaths.map(p => '/writable/' + p).join(', ')}]`;
+    }
+
     console.error(`[pinocchio] Starting agent: ${agentId}`);
     console.error(`[pinocchio] Workspace: ${workspace_path}`);
     console.error(`[pinocchio] Access mode: ${accessMode}`);
@@ -2026,7 +2062,7 @@ async function spawnDockerAgent(args: {
 
     // Build environment variables
     const envVars = [
-      `AGENT_TASK=${sanitizedTask}`,
+      `AGENT_TASK=${taskWithGuidance}`,
       `AGENT_WORKDIR=/workspace`,
       `HOME=/home/agent`,
       `WORKSPACE_MODE=${hasWritablePaths ? "restricted" : "readonly"}`,
@@ -2111,12 +2147,20 @@ async function spawnDockerAgent(args: {
       binds.push(`${tokenFilePath}:/run/secrets/github_token:ro`);
     }
 
-    // Add writable path mounts (these overlay the read-only workspace)
-    for (const writablePath of resolvedWritablePaths) {
-      // Convert host path to container path
-      const relativePath = path.relative(workspace_path, writablePath);
-      const containerPath = path.join("/workspace", relativePath);
-      binds.push(`${writablePath}:${containerPath}:rw`);
+    // Issue #90: Mount writable paths to /writable/{rel-path} with tree isolation
+    if (resolvedWritablePaths.length > 0) {
+      const relativePaths = resolvedWritablePaths.map(p => path.relative(workspace_path, p));
+      await createTreeWritableDirs(treeId, relativePaths);
+
+      for (const writablePath of resolvedWritablePaths) {
+        const relativePath = path.relative(workspace_path, writablePath);
+        const hostWritableDir = path.join(getTreeWritableDir(treeId), relativePath);
+        const containerPath = path.posix.join("/writable", relativePath);
+        binds.push(`${hostWritableDir}:${containerPath}:rw`);
+      }
+
+      envVars.push(`PINOCCHIO_WRITABLE_ROOT=/writable`);
+      envVars.push(`PINOCCHIO_WRITABLE_PATHS=${relativePaths.join(':')}`);
     }
 
     // Create container with security hardening

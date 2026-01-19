@@ -12,6 +12,7 @@ import {
   AgentMetadata,
   SpawnTree,
   cleanupTokenFile,
+  cleanupTreeWritableDir,
 } from "../index.js";
 import {
   invalidateTokensForAgent,
@@ -217,6 +218,9 @@ export async function terminateTree(
 
   // PR #86: Clean up tree buffer to prevent memory leak
   eventBus.clearTreeBuffer(treeId);
+
+  // Issue #90: Clean up tree's writable directory
+  await cleanupTreeWritableDir(treeId);
 
   console.error(`[pinocchio] Cascade termination: Tree ${treeId} terminated. ` +
     `Terminated: ${result.terminated.length}, Failed: ${result.failed.length}`);
