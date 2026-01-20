@@ -29,6 +29,9 @@ export HOST_GH_CONFIG="${HOST_GH_CONFIG:-$HOME/.config/gh}"
 # Ensure config directory exists
 mkdir -p "$HOST_CONFIG_DIR"
 
+# Create socket directory on host for UDS sharing with agents
+mkdir -p /tmp/pinocchio
+
 # Create default config if it doesn't exist
 if [ ! -f "$HOST_CONFIG_DIR/config.json" ]; then
   cat > "$HOST_CONFIG_DIR/config.json" << EOF

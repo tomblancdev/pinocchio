@@ -59,6 +59,8 @@ services:
       - ${HOST_CONFIG_DIR:-~/.config/pinocchio}:/root/.config/pinocchio:rw
       # GitHub CLI config (for gh commands in agents)
       - ${HOST_GH_CONFIG:-~/.config/gh}:/root/.config/gh:ro
+      # Share socket directory with host for nested agent access
+      - /tmp/pinocchio:/tmp/pinocchio:rw
     networks:
       - docker-proxy
     stdin_open: true
