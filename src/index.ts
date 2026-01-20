@@ -325,7 +325,17 @@ interface AuditEvent {
 async function loadConfig(): Promise<AgentConfig> {
   try {
     const data = await fs.readFile(CONFIG_FILE, "utf-8");
-    return { ...DEFAULT_CONFIG, ...JSON.parse(data) };
+    const persisted = JSON.parse(data);
+    // Deep merge websocket config to preserve defaults like unixSocket
+    // when existing configs don't have the new field
+    return {
+      ...DEFAULT_CONFIG,
+      ...persisted,
+      websocket: {
+        ...DEFAULT_CONFIG.websocket,
+        ...persisted.websocket,
+      },
+    };
   } catch {
     return DEFAULT_CONFIG;
   }
