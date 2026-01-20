@@ -61,23 +61,24 @@ if [ -n "$AGENT_WORKDIR" ] && [ -d "$AGENT_WORKDIR" ]; then
 fi
 
 # Configure spawn proxy MCP server for nested agent spawning
-# Claude reads MCP servers from $CLAUDE_CONFIG_DIR/.claude.json (not $HOME!)
 if [ -n "$PINOCCHIO_API_URL" ] && [ -n "$PINOCCHIO_SESSION_TOKEN" ]; then
-    cat > "$CLAUDE_CONFIG_DIR/.claude.json" << EOF
+    MCP_CONFIG_DIR="/tmp/claude-mcp-config"
+    mkdir -p "$MCP_CONFIG_DIR"
+    export CLAUDE_MCP_SERVERS_DIR="$MCP_CONFIG_DIR"
+    cat > "$MCP_CONFIG_DIR/mcp_servers.json" << EOF
 {
-  "mcpServers": {
-    "spawn-proxy": {
-      "command": "/usr/local/bin/spawn-proxy",
-      "env": {
-        "PINOCCHIO_API_URL": "$PINOCCHIO_API_URL",
-        "PINOCCHIO_SESSION_TOKEN": "$PINOCCHIO_SESSION_TOKEN",
-        "PINOCCHIO_HOST_WORKSPACE": "$PINOCCHIO_HOST_WORKSPACE"
-      }
+  "spawn-proxy": {
+    "command": "/usr/local/bin/spawn-proxy",
+    "args": [],
+    "env": {
+      "PINOCCHIO_API_URL": "$PINOCCHIO_API_URL",
+      "PINOCCHIO_SESSION_TOKEN": "$PINOCCHIO_SESSION_TOKEN",
+      "PINOCCHIO_HOST_WORKSPACE": "$PINOCCHIO_HOST_WORKSPACE"
     }
   }
 }
 EOF
-    echo "[entrypoint] Spawn proxy MCP server configured at $CLAUDE_CONFIG_DIR/.claude.json"
+    echo "[entrypoint] Spawn proxy MCP server configured"
 else
     echo "[entrypoint] Spawn proxy not configured (PINOCCHIO_API_URL or PINOCCHIO_SESSION_TOKEN not set)"
 fi

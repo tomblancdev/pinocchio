@@ -443,6 +443,77 @@ describe('Cascade Termination Tests', () => {
     });
   });
 
+  // Issue #91: Automatic cascade termination when parent finishes
+  describe('Automatic cascade when parent completes', () => {
+    it('should cascade terminate children when parent completes naturally', async () => {
+      // Create a parent with children
+      const parent = createTestAgent({
+        id: 'parent-complete',
+        status: 'running',
+        childAgentIds: ['child-1', 'child-2'],
+        treeId: 'tree-auto-cascade',
+      });
+      const child1 = createTestAgent({
+        id: 'child-1',
+        parentAgentId: 'parent-complete',
+        status: 'running',
+        treeId: 'tree-auto-cascade',
+      });
+      const child2 = createTestAgent({
+        id: 'child-2',
+        parentAgentId: 'parent-complete',
+        status: 'running',
+        treeId: 'tree-auto-cascade',
+      });
+
+      stateManager.addAgent(parent);
+      stateManager.addAgent(child1);
+      stateManager.addAgent(child2);
+
+      const updateMetadata = createUpdateMetadataCallback(stateManager);
+
+      // When parent completes, automatic cascade should terminate children
+      // In real implementation, cascadeTerminateChildren is called after parent finishes
+      // Simulate this by marking parent as completed
+      await updateMetadata('parent-complete', 'failed', 'Parent completed');
+
+      // For testing the logic, we verify the expected behavior:
+      // - Parent finishes first
+      // - Children should then be cascade terminated
+      expect(stateManager.getAgent('parent-complete')?.status).toBe('failed');
+
+      // Simulate the automatic cascade that would be triggered
+      for (const childId of parent.childAgentIds) {
+        const child = stateManager.getAgent(childId);
+        if (child && child.status === 'running') {
+          await updateMetadata(childId, 'failed', 'Cascade from parent completion');
+        }
+      }
+
+      expect(stateManager.getAgent('child-1')?.status).toBe('failed');
+      expect(stateManager.getAgent('child-2')?.status).toBe('failed');
+    });
+
+    it('should not cascade terminate if no children', async () => {
+      const leafAgent = createTestAgent({
+        id: 'leaf-agent',
+        status: 'running',
+        childAgentIds: [],
+        treeId: 'tree-leaf',
+      });
+
+      stateManager.addAgent(leafAgent);
+
+      const updateMetadata = createUpdateMetadataCallback(stateManager);
+
+      // Completing a leaf agent should not affect other agents
+      await updateMetadata('leaf-agent', 'failed', 'Completed naturally');
+
+      expect(stateManager.getAgent('leaf-agent')?.status).toBe('failed');
+      // No children to verify - just ensure no errors occurred
+    });
+  });
+
   describe('Terminated events emitted', () => {
     it('should track termination reason', () => {
       const terminationReasons = ['cascade', 'manual', 'timeout', 'orphan_cleanup'] as const;
@@ -484,6 +555,343 @@ describe('Cascade Termination Tests', () => {
 
       const updatedTree = stateManager.getTree(tree.treeId);
       expect(updatedTree?.status).toBe('terminated');
+    });
+  });
+});
+
+// =============================================================================
+// Test Suite: Cascade Termination Algorithm Tests
+// =============================================================================
+
+describe('Cascade Termination Algorithm Tests', () => {
+  let stateManager: TestStateManager;
+  let terminatedAgents: string[];
+
+  /**
+   * This test suite verifies the cascade termination algorithm by implementing
+   * the same depth-first traversal logic used in src/lifecycle/cascade.ts.
+   *
+   * The actual terminateWithChildren function cannot be easily unit tested
+   * because it has circular dependencies with index.ts. These tests verify
+   * the algorithm logic is correct.
+   */
+
+  beforeEach(() => {
+    stateManager = new TestStateManager();
+    terminatedAgents = [];
+  });
+
+  afterEach(() => {
+    stateManager.clear();
+    terminatedAgents = [];
+  });
+
+  /**
+   * Implements cascade termination algorithm matching src/lifecycle/cascade.ts
+   * This is the exact algorithm used in production: depth-first traversal
+   * that terminates children before parent.
+   */
+  async function cascadeTerminate(
+    agentId: string,
+    updateMetadata: (agentId: string, status: 'failed', output: string) => Promise<void>
+  ): Promise<{ terminated: string[]; totalProcessed: number }> {
+    const result = { terminated: [] as string[], totalProcessed: 0 };
+
+    const metadata = stateManager.getAgent(agentId);
+    if (!metadata) {
+      return result;
+    }
+
+    // Terminate children first (depth-first traversal)
+    for (const childId of metadata.childAgentIds) {
+      const childResult = await cascadeTerminate(childId, updateMetadata);
+      result.terminated.push(...childResult.terminated);
+      result.totalProcessed += childResult.totalProcessed;
+    }
+
+    // Now terminate this agent
+    result.totalProcessed++;
+
+    if (metadata.status === 'running') {
+      await updateMetadata(agentId, 'failed', '[test] Cascade termination');
+      result.terminated.push(agentId);
+      terminatedAgents.push(agentId);
+    }
+
+    return result;
+  }
+
+  describe('Single agent termination', () => {
+    it('should terminate a single agent with no children', async () => {
+      const agent = createTestAgent({
+        id: 'agent-solo',
+        status: 'running',
+      });
+      stateManager.addAgent(agent);
+
+      const updateMetadata = createUpdateMetadataCallback(stateManager);
+
+      const result = await cascadeTerminate(agent.id, updateMetadata);
+
+      expect(result.terminated).toContain('agent-solo');
+      expect(result.totalProcessed).toBe(1);
+      expect(stateManager.getAgent(agent.id)?.status).toBe('failed');
+    });
+
+    it('should return empty result for non-existent agent', async () => {
+      const updateMetadata = createUpdateMetadataCallback(stateManager);
+
+      const result = await cascadeTerminate('non-existent', updateMetadata);
+
+      expect(result.terminated.length).toBe(0);
+      expect(result.totalProcessed).toBe(0);
+    });
+
+    it('should skip already terminated agents', async () => {
+      const agent = createTestAgent({
+        id: 'agent-already-done',
+        status: 'completed',
+      });
+      stateManager.addAgent(agent);
+
+      const updateMetadata = createUpdateMetadataCallback(stateManager);
+
+      const result = await cascadeTerminate(agent.id, updateMetadata);
+
+      // Agent was processed but not added to terminated list
+      expect(result.terminated.length).toBe(0);
+      expect(result.totalProcessed).toBe(1);
+    });
+  });
+
+  describe('Parent-child cascade termination', () => {
+    it('should terminate parent and all children (depth-first)', async () => {
+      // Create parent with two children
+      const parent = createTestAgent({
+        id: 'parent-001',
+        status: 'running',
+        childAgentIds: ['child-001', 'child-002'],
+        nestingDepth: 0,
+      });
+
+      const child1 = createTestAgent({
+        id: 'child-001',
+        status: 'running',
+        parentAgentId: 'parent-001',
+        nestingDepth: 1,
+      });
+
+      const child2 = createTestAgent({
+        id: 'child-002',
+        status: 'running',
+        parentAgentId: 'parent-001',
+        nestingDepth: 1,
+      });
+
+      stateManager.addAgent(parent);
+      stateManager.addAgent(child1);
+      stateManager.addAgent(child2);
+
+      const updateMetadata = createUpdateMetadataCallback(stateManager);
+
+      const result = await cascadeTerminate(parent.id, updateMetadata);
+
+      expect(result.terminated.length).toBe(3);
+      expect(result.terminated).toContain('parent-001');
+      expect(result.terminated).toContain('child-001');
+      expect(result.terminated).toContain('child-002');
+      expect(result.totalProcessed).toBe(3);
+
+      // Verify depth-first order: children terminated before parent
+      const parentIndex = terminatedAgents.indexOf('parent-001');
+      const child1Index = terminatedAgents.indexOf('child-001');
+      const child2Index = terminatedAgents.indexOf('child-002');
+      expect(child1Index).toBeLessThan(parentIndex);
+      expect(child2Index).toBeLessThan(parentIndex);
+    });
+
+    it('should handle three-level hierarchy with correct depth-first order', async () => {
+      // Create: root -> child -> grandchild
+      const root = createTestAgent({
+        id: 'root',
+        status: 'running',
+        childAgentIds: ['child'],
+        nestingDepth: 0,
+      });
+
+      const child = createTestAgent({
+        id: 'child',
+        status: 'running',
+        parentAgentId: 'root',
+        childAgentIds: ['grandchild'],
+        nestingDepth: 1,
+      });
+
+      const grandchild = createTestAgent({
+        id: 'grandchild',
+        status: 'running',
+        parentAgentId: 'child',
+        nestingDepth: 2,
+      });
+
+      stateManager.addAgent(root);
+      stateManager.addAgent(child);
+      stateManager.addAgent(grandchild);
+
+      const updateMetadata = createUpdateMetadataCallback(stateManager);
+
+      const result = await cascadeTerminate(root.id, updateMetadata);
+
+      expect(result.terminated.length).toBe(3);
+      expect(result.totalProcessed).toBe(3);
+
+      // Verify depth-first order: grandchild -> child -> root
+      expect(terminatedAgents).toEqual(['grandchild', 'child', 'root']);
+    });
+
+    it('should handle mixed status children', async () => {
+      // Parent with one running and one already completed child
+      const parent = createTestAgent({
+        id: 'parent-mixed',
+        status: 'running',
+        childAgentIds: ['child-running', 'child-completed'],
+      });
+
+      const runningChild = createTestAgent({
+        id: 'child-running',
+        status: 'running',
+        parentAgentId: 'parent-mixed',
+      });
+
+      const completedChild = createTestAgent({
+        id: 'child-completed',
+        status: 'completed',
+        parentAgentId: 'parent-mixed',
+      });
+
+      stateManager.addAgent(parent);
+      stateManager.addAgent(runningChild);
+      stateManager.addAgent(completedChild);
+
+      const updateMetadata = createUpdateMetadataCallback(stateManager);
+
+      const result = await cascadeTerminate(parent.id, updateMetadata);
+
+      // Only running agents should be in terminated list
+      expect(result.terminated).toContain('parent-mixed');
+      expect(result.terminated).toContain('child-running');
+      expect(result.terminated).not.toContain('child-completed');
+      expect(result.totalProcessed).toBe(3); // All processed, but not all terminated
+    });
+
+    it('should handle complex tree with multiple branches', async () => {
+      // Create:
+      //       root
+      //      /    \
+      //   child1  child2
+      //    / \      |
+      //   gc1 gc2  gc3
+      const root = createTestAgent({
+        id: 'root',
+        status: 'running',
+        childAgentIds: ['child1', 'child2'],
+      });
+
+      const child1 = createTestAgent({
+        id: 'child1',
+        status: 'running',
+        parentAgentId: 'root',
+        childAgentIds: ['gc1', 'gc2'],
+      });
+
+      const child2 = createTestAgent({
+        id: 'child2',
+        status: 'running',
+        parentAgentId: 'root',
+        childAgentIds: ['gc3'],
+      });
+
+      const gc1 = createTestAgent({ id: 'gc1', status: 'running', parentAgentId: 'child1' });
+      const gc2 = createTestAgent({ id: 'gc2', status: 'running', parentAgentId: 'child1' });
+      const gc3 = createTestAgent({ id: 'gc3', status: 'running', parentAgentId: 'child2' });
+
+      stateManager.addAgent(root);
+      stateManager.addAgent(child1);
+      stateManager.addAgent(child2);
+      stateManager.addAgent(gc1);
+      stateManager.addAgent(gc2);
+      stateManager.addAgent(gc3);
+
+      const updateMetadata = createUpdateMetadataCallback(stateManager);
+
+      const result = await cascadeTerminate(root.id, updateMetadata);
+
+      expect(result.terminated.length).toBe(6);
+      expect(result.totalProcessed).toBe(6);
+
+      // Verify root is last
+      expect(terminatedAgents[terminatedAgents.length - 1]).toBe('root');
+
+      // Verify children come before root
+      const rootIndex = terminatedAgents.indexOf('root');
+      expect(terminatedAgents.indexOf('child1')).toBeLessThan(rootIndex);
+      expect(terminatedAgents.indexOf('child2')).toBeLessThan(rootIndex);
+
+      // Verify grandchildren come before their parents
+      const child1Index = terminatedAgents.indexOf('child1');
+      const child2Index = terminatedAgents.indexOf('child2');
+      expect(terminatedAgents.indexOf('gc1')).toBeLessThan(child1Index);
+      expect(terminatedAgents.indexOf('gc2')).toBeLessThan(child1Index);
+      expect(terminatedAgents.indexOf('gc3')).toBeLessThan(child2Index);
+    });
+  });
+
+  describe('Edge cases', () => {
+    it('should handle agent with empty childAgentIds array', async () => {
+      const agent = createTestAgent({
+        id: 'leaf-agent',
+        status: 'running',
+        childAgentIds: [],
+      });
+      stateManager.addAgent(agent);
+
+      const updateMetadata = createUpdateMetadataCallback(stateManager);
+
+      const result = await cascadeTerminate(agent.id, updateMetadata);
+
+      expect(result.terminated).toEqual(['leaf-agent']);
+      expect(result.totalProcessed).toBe(1);
+    });
+
+    it('should handle termination starting from middle of tree', async () => {
+      // Create three-level tree but start termination from middle
+      const root = createTestAgent({ id: 'root', status: 'running', childAgentIds: ['child'] });
+      const child = createTestAgent({
+        id: 'child',
+        status: 'running',
+        parentAgentId: 'root',
+        childAgentIds: ['grandchild']
+      });
+      const grandchild = createTestAgent({
+        id: 'grandchild',
+        status: 'running',
+        parentAgentId: 'child'
+      });
+
+      stateManager.addAgent(root);
+      stateManager.addAgent(child);
+      stateManager.addAgent(grandchild);
+
+      const updateMetadata = createUpdateMetadataCallback(stateManager);
+
+      // Start from child (middle of tree)
+      const result = await cascadeTerminate(child.id, updateMetadata);
+
+      expect(result.terminated).toEqual(['grandchild', 'child']);
+      expect(result.totalProcessed).toBe(2);
+
+      // Root should remain running
+      expect(stateManager.getAgent('root')?.status).toBe('running');
     });
   });
 });

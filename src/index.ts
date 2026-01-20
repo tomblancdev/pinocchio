@@ -934,6 +934,40 @@ function checkAndTerminateTree(treeId: string): void {
   }
 }
 
+// Issue #91: Automatic cascade termination when parent finishes
+// When a parent agent completes or fails, immediately terminate its children
+// rather than waiting for orphan detection (which runs every 60 seconds)
+async function cascadeTerminateChildren(agentId: string): Promise<void> {
+  const metadata = agentMetadata.get(agentId);
+  if (!metadata || metadata.childAgentIds.length === 0) {
+    return; // No children to terminate
+  }
+
+  console.error(`[pinocchio] Issue #91: Agent ${agentId} has ${metadata.childAgentIds.length} children, triggering automatic cascade termination`);
+
+  // Terminate each child (which will recursively terminate grandchildren)
+  for (const childId of metadata.childAgentIds) {
+    const childMetadata = agentMetadata.get(childId);
+    if (!childMetadata || childMetadata.status !== "running") {
+      continue; // Skip already terminated children
+    }
+
+    try {
+      const result = await terminateWithChildren(
+        childId,
+        "SIGTERM",
+        updateAgentMetadataForCascade,
+        runningAgents,
+        agentId, // This agent initiated the cascade
+        "cascade"
+      );
+      console.error(`[pinocchio] Issue #91: Cascade terminated ${result.terminated.length} agents (child tree of ${childId})`);
+    } catch (error) {
+      console.error(`[pinocchio] Issue #91: Failed to cascade terminate child ${childId}: ${error}`);
+    }
+  }
+}
+
 // WebSocket server instance (initialized in main if enabled)
 let wsServer: PinocchioWebSocket | null = null;
 
@@ -2561,6 +2595,9 @@ async function spawnDockerAgent(args: {
     // RELIABILITY FIX #4: Persist state when agent completes
     await saveAgentState();
 
+    // Issue #91: Cascade terminate children when parent finishes
+    await cascadeTerminateChildren(agentId);
+
     // Issue #46: Check if the tree should be terminated and persist tree state
     checkAndTerminateTree(metadata.treeId);
     await saveTreeState();
@@ -2634,6 +2671,9 @@ async function spawnDockerAgent(args: {
       metadata.endedAt = new Date();
       // RELIABILITY FIX #4: Persist state when agent fails
       await saveAgentState();
+
+      // Issue #91: Cascade terminate children when parent fails
+      await cascadeTerminateChildren(agentId);
 
       // Issue #46: Check if the tree should be terminated and persist tree state
       checkAndTerminateTree(metadata.treeId);
@@ -2806,6 +2846,9 @@ async function monitorAgent(agentId: string, container: Docker.Container, timeou
     // RELIABILITY FIX #4: Persist state when background agent completes
     await saveAgentState();
 
+    // Issue #91: Cascade terminate children when parent finishes (background)
+    await cascadeTerminateChildren(agentId);
+
     // Issue #46: Check if the tree should be terminated and persist tree state
     checkAndTerminateTree(metadata.treeId);
     await saveTreeState();
@@ -2861,6 +2904,9 @@ async function monitorAgent(agentId: string, container: Docker.Container, timeou
 
     // RELIABILITY FIX #4: Persist state when background agent fails
     await saveAgentState();
+
+    // Issue #91: Cascade terminate children when parent fails (background)
+    await cascadeTerminateChildren(agentId);
 
     // Issue #46: Check if the tree should be terminated and persist tree state
     checkAndTerminateTree(metadata.treeId);
