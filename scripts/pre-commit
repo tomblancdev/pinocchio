@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+#
+# Pre-commit hook: Runs fast checks on staged files
+# Install: cp scripts/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+#
+
+set -e
+
+# Color output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+echo -e "${YELLOW}Running pre-commit checks...${NC}"
+
+# Get staged TypeScript files (null-terminated for safe handling)
+STAGED_TS_COUNT=$(git diff --cached --name-only -z --diff-filter=ACM | tr '\0' '\n' | grep -c '\.ts$' || true)
+
+if [ "$STAGED_TS_COUNT" -gt 0 ]; then
+    # 1. Lint staged files (using null-terminated args to prevent command injection)
+    echo -e "${YELLOW}Linting staged files...${NC}"
+    if git diff --cached --name-only -z --diff-filter=ACM | grep -z '\.ts$' | xargs -0 npx biome lint --no-errors-on-unmatched; then
+        echo -e "${GREEN}Lint check passed${NC}"
+    else
+        echo -e "${RED}Lint check failed${NC}"
+        exit 1
+    fi
+fi
+
+# 2. Run tests (fast)
+echo -e "${YELLOW}Running tests...${NC}"
+if npm test --silent; then
+    echo -e "${GREEN}Tests passed${NC}"
+else
+    echo -e "${RED}Tests failed${NC}"
+    exit 1
+fi
+
+echo -e "${GREEN}All pre-commit checks passed!${NC}"
