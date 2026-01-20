@@ -165,11 +165,14 @@ export class PinocchioWebSocket {
       // Handle WebSocket upgrades on Unix socket
       this.setupUpgradeHandler(this.unixServer);
 
-      this.unixServer.listen(this.config.unixSocket, () => {
+      const socketPath = this.config.unixSocket;
+      this.unixServer.listen(socketPath, () => {
         // Set socket permissions to allow non-root agents (UID 1000) to connect
-        chmodSync(this.config.unixSocket, 0o777);
+        if (socketPath) {
+          chmodSync(socketPath, 0o777);
+        }
         console.error(
-          `[pinocchio-ws] WebSocket server listening on Unix socket: ${this.config.unixSocket}`
+          `[pinocchio-ws] WebSocket server listening on Unix socket: ${socketPath}`
         );
         console.error(
           `[pinocchio-ws] HTTP endpoints available: GET /health, POST /api/v1/spawn`
