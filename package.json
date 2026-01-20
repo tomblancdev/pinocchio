@@ -26,10 +26,17 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
-    "docker:build": "docker build -t claude-agent:latest ./agent-image",
     "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js --config src/jest.config.js",
     "test:watch": "node --experimental-vm-modules node_modules/jest/bin/jest.js --config src/jest.config.js --watch",
-    "test:coverage": "node --experimental-vm-modules node_modules/jest/bin/jest.js --config src/jest.config.js --coverage"
+    "test:coverage": "node --experimental-vm-modules node_modules/jest/bin/jest.js --config src/jest.config.js --coverage",
+    "lint": "biome lint src/",
+    "lint:fix": "biome lint --write src/",
+    "format": "biome format src/",
+    "format:fix": "biome format --write src/",
+    "typecheck": "tsc --noEmit",
+    "precheck": "npm run typecheck && npm test && npm run build",
+    "prepare": "([ -f .git/hooks/pre-push ] || cp scripts/pre-push .git/hooks/pre-push 2>/dev/null && chmod +x .git/hooks/pre-push; [ -f .git/hooks/pre-commit ] || cp scripts/pre-commit .git/hooks/pre-commit 2>/dev/null && chmod +x .git/hooks/pre-commit) || true",
+    "docker:build": "docker build -t claude-agent:latest ./agent-image"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
@@ -39,6 +46,7 @@
     "ws": "^8.18.0"
   },
   "devDependencies": {
+    "@biomejs/biome": "^2.3.11",
     "@types/dockerode": "^3.3.0",
     "@types/jest": "^29.0.0",
     "@types/node": "^20.0.0",
