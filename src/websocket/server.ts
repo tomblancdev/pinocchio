@@ -687,8 +687,9 @@ export class PinocchioWebSocket {
     }
 
     // PR #73 Fix 3: Validate workspace path against allowed workspaces
+    // Pass treeId to allow tree writable paths for sub-agents
     const workspacePath = body.workspace_path || '/workspace';
-    const workspaceValidation = await this.validateWorkspacePath(workspacePath);
+    const workspaceValidation = await this.validateWorkspacePath(workspacePath, sessionToken.treeId);
     if (!workspaceValidation.allowed) {
       this.sendJsonResponse(res, 403, {
         error: `Forbidden: ${workspaceValidation.reason}`,
@@ -903,9 +904,11 @@ export class PinocchioWebSocket {
   /**
    * PR #73 Fix 3: Validate workspace path against allowed workspaces.
    * Loads config and checks if the path is in the allowlist.
+   * Also allows tree writable directories when treeId is provided.
    */
   private async validateWorkspacePath(
-    workspacePath: string
+    workspacePath: string,
+    treeId?: string
   ): Promise<{ allowed: boolean; reason?: string }> {
     const CONFIG_FILE = path.join(
       os.homedir(),
@@ -949,6 +952,18 @@ export class PinocchioWebSocket {
     for (const blocked of blockedPaths) {
       if (realPath === blocked || realPath.startsWith(blocked + '/')) {
         return { allowed: false, reason: `System path "${blocked}" is not allowed` };
+      }
+    }
+
+    // Allow tree writable paths for sub-agents
+    if (treeId) {
+      const hostHome = process.env.HOST_HOME || os.homedir();
+      const treeWritableDir = path.join(hostHome, '.config', 'pinocchio', 'writable', treeId);
+      // Use path.resolve for consistency (the directory might not exist yet for the first child)
+      const normalizedTreeWritable = path.resolve(treeWritableDir);
+      if (realPath === normalizedTreeWritable || realPath.startsWith(normalizedTreeWritable + '/')) {
+        console.error(`[pinocchio-ws] Allowing workspace in tree writable directory: ${workspacePath}`);
+        return { allowed: true };
       }
     }
 

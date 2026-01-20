@@ -196,6 +196,73 @@ const AGENTS_STATE_FILE = path.join(os.homedir(), ".config", "pinocchio", "agent
 // Issue #46: Persistent spawn tree state file path
 const TREES_STATE_FILE = path.join(os.homedir(), ".config", "pinocchio", "trees.json");
 
+// Issue #90: Tree-level writable paths directory
+// Each spawn tree gets its own writable directory for isolation
+// Container path (for local filesystem operations inside MCP container)
+const WRITABLE_BASE_DIR = path.join(os.homedir(), ".config", "pinocchio", "writable");
+// Host path (for Docker bind mounts - must use HOST_HOME not os.homedir())
+const HOST_HOME = process.env.HOST_HOME || os.homedir();
+const HOST_WRITABLE_BASE_DIR = path.join(HOST_HOME, ".config", "pinocchio", "writable");
+
+// Issue #90: Helper functions for tree-level writable paths
+
+function getTreeWritableDir(treeId: string): string {
+  return path.join(WRITABLE_BASE_DIR, treeId);
+}
+
+function getHostTreeWritableDir(treeId: string): string {
+  return path.join(HOST_WRITABLE_BASE_DIR, treeId);
+}
+
+function validateTreeId(treeId: string): void {
+  // Validate treeId format: should be tree-<uuid>
+  const treeIdPattern = /^tree-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  // Also allow legacy format: tree-legacy-<agentId>
+  const legacyPattern = /^tree-legacy-[a-zA-Z0-9_-]+$/;
+
+  if (!treeIdPattern.test(treeId) && !legacyPattern.test(treeId)) {
+    throw new Error(`Invalid treeId format: ${treeId}`);
+  }
+
+  // Reject path traversal attempts
+  if (treeId.includes('..') || treeId.includes('/') || treeId.includes('\\')) {
+    throw new Error(`Invalid treeId: contains path traversal characters: ${treeId}`);
+  }
+}
+
+async function createTreeWritableDirs(treeId: string, relativePaths: string[]): Promise<void> {
+  validateTreeId(treeId);
+
+  const treeDir = getTreeWritableDir(treeId);
+  await fs.mkdir(treeDir, { recursive: true, mode: 0o755 });
+  // Explicit chmod to override umask which may have masked the mode
+  await fs.chmod(treeDir, 0o755);
+
+  for (const relPath of relativePaths) {
+    // Defense-in-depth: reject paths with parent traversal
+    if (relPath.includes('..') || path.isAbsolute(relPath)) {
+      console.error(`[pinocchio] Skipping invalid writable path: ${relPath}`);
+      continue;
+    }
+    const fullPath = path.join(treeDir, relPath);
+    await fs.mkdir(fullPath, { recursive: true, mode: 0o755 });
+    // Explicit chmod to override umask which may have masked the mode
+    await fs.chmod(fullPath, 0o755);
+  }
+}
+
+export async function cleanupTreeWritableDir(treeId: string): Promise<void> {
+  validateTreeId(treeId);
+
+  const treeDir = getTreeWritableDir(treeId);
+  try {
+    await fs.rm(treeDir, { recursive: true, force: true });
+    console.error(`[pinocchio] Cleaned up writable directory for tree: ${treeId}`);
+  } catch (error) {
+    console.error(`[pinocchio] Failed to cleanup writable dir for tree ${treeId}:`, error);
+  }
+}
+
 // Issue #47: Nested spawning configuration
 // Controls limits and behavior for agent-spawned agents
 export interface NestedSpawnConfig {
@@ -1264,6 +1331,50 @@ async function isWorkspaceAllowed(workspacePath: string): Promise<{ allowed: boo
   return { allowed: true };
 }
 
+/**
+ * Validates that a sub-agent's workspace request is within allowed boundaries.
+ * Sub-agents can only access:
+ * 1. The same workspace as their parent (inherits parent's access)
+ * 2. Any path under the tree's /writable/ directory
+ *
+ * @param parentMetadata - The parent agent's metadata
+ * @param requestedWorkspace - The workspace path requested by the sub-agent
+ * @param treeId - The spawn tree ID for writable directory access
+ * @returns Object with allowed boolean and optional reason string
+ */
+function validateSubagentWorkspace(
+  parentMetadata: AgentMetadata,
+  requestedWorkspace: string,
+  treeId: string
+): { allowed: boolean; reason?: string } {
+  // Normalize paths for comparison
+  const normalizedRequested = path.resolve(requestedWorkspace);
+  const normalizedParentWorkspace = path.resolve(parentMetadata.workspacePath);
+  const treeWritableDir = getHostTreeWritableDir(treeId);
+  const normalizedTreeWritable = path.resolve(treeWritableDir);
+
+  // Check if requested workspace is the same as parent's workspace
+  if (normalizedRequested === normalizedParentWorkspace) {
+    return { allowed: true };
+  }
+
+  // Check if requested workspace is under parent's workspace
+  if (normalizedRequested.startsWith(normalizedParentWorkspace + "/")) {
+    return { allowed: true };
+  }
+
+  // Check if requested workspace is under the tree's writable directory
+  if (normalizedRequested === normalizedTreeWritable ||
+      normalizedRequested.startsWith(normalizedTreeWritable + "/")) {
+    return { allowed: true };
+  }
+
+  return {
+    allowed: false,
+    reason: `Sub-agent workspace must be within parent's workspace ('${parentMetadata.workspacePath}') or the tree's writable directory ('${treeWritableDir}'). Requested: '${requestedWorkspace}'`
+  };
+}
+
 // Tool definitions
 const TOOLS = [
   {
@@ -1273,18 +1384,18 @@ const TOOLS = [
 The agent runs with full autonomy (YOLO mode) inside a secured container with:
 - Read-only access to your Claude Max credentials
 - Configurable network access (disabled by default for security)
-- **Read-only workspace by default** - agent can only read files unless writable paths are specified
+- **Read-only workspace by default** - use workspace_writable: true for direct file modifications
 - Optional Docker access via secure proxy for running tests/builds
 
 **Security Model:**
-- Workspace is mounted READ-ONLY by default
-- Use 'writable_paths' or 'writable_patterns' to allow writing to specific files/folders
-- This ensures agents can only modify what you explicitly allow
+- Workspace (/workspace) is mounted READ-ONLY by default
+- Set 'workspace_writable: true' to allow direct file modifications
+- Use 'writable_paths' for tree-isolated scratch space at /writable/
 
 **Examples:**
-- Review code: no writable paths needed (read-only)
-- Fix a bug: writable_paths: ['src/buggy-file.ts']
-- Run tests: writable_patterns: ['**/*.test.ts', 'coverage/']`,
+- Review code: no options needed (read-only workspace)
+- Fix a bug: workspace_writable: true (direct workspace writes)
+- Isolated work: writable_paths: ['output/'] (scratch space at /writable/output/)`,
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -1324,6 +1435,10 @@ The agent runs with full autonomy (YOLO mode) inside a secured container with:
           type: "array",
           items: { type: "string" },
           description: "Glob patterns (relative to workspace) for writable files. Example: ['src/**/*.ts', '*.md']",
+        },
+        workspace_writable: {
+          type: "boolean",
+          description: "Mount workspace as read-write, allowing agent to directly modify project files. Default: false (read-only workspace).",
         },
         run_in_background: {
           type: "boolean",
@@ -1724,6 +1839,7 @@ async function spawnDockerAgent(args: {
   allow_network?: boolean;
   writable_paths?: string[];
   writable_patterns?: string[];
+  workspace_writable?: boolean;
   run_in_background?: boolean;
   github_access?: "none" | "read" | "comment" | "write" | "manage" | "admin";
   // Issue #49: Internal parameter for nested spawning
@@ -1921,6 +2037,27 @@ async function spawnDockerAgent(args: {
     }
 
     console.error(`[pinocchio] Nested spawn: parent=${args.parent_agent_id}, tree=${parentTreeId}, depth=${nestingDepth}`);
+
+    // Validate sub-agent workspace restriction
+    // Sub-agents can only access: parent's workspace OR tree's writable directory
+    const subagentWorkspaceCheck = validateSubagentWorkspace(parentMetadata, workspace_path, parentTreeId);
+    if (!subagentWorkspaceCheck.allowed) {
+      pendingReservations.delete(agentId);
+      await auditLog("spawn.subagent_workspace_denied", {
+        requested_agent_id: agentId,
+        parent_agent_id: args.parent_agent_id,
+        parent_workspace: parentMetadata.workspacePath,
+        requested_workspace: workspace_path,
+        tree_id: parentTreeId,
+      });
+      return {
+        content: [{
+          type: "text" as const,
+          text: `## Sub-agent Workspace Access Denied\n\n**Error:** ${subagentWorkspaceCheck.reason}`,
+        }],
+        isError: true,
+      };
+    }
   }
 
   // Apply timeout limits: default 1h, max 24h (configurable via env)
@@ -1928,17 +2065,26 @@ async function spawnDockerAgent(args: {
   const timeout_ms = Math.min(Math.max(requestedTimeout, 1000), CONFIG.absoluteMaxTimeout);
 
   // Validate workspace path against allowlist
-  const workspaceCheck = await isWorkspaceAllowed(workspace_path);
-  if (!workspaceCheck.allowed) {
-    // SECURITY FIX #5.1: Release reservation on early return
-    pendingReservations.delete(agentId);
-    return {
-      content: [{
-        type: "text" as const,
-        text: `## Workspace path not allowed\n\n**Error:** ${workspaceCheck.reason}`,
-      }],
-      isError: true,
-    };
+  // Skip allowlist check for sub-agents using tree writable directory (already validated above)
+  const isSubagentUsingTreeWritable = args.parent_agent_id && parentTreeId && (() => {
+    const normalizedWorkspace = path.resolve(workspace_path);
+    const treeWritableDir = path.resolve(getHostTreeWritableDir(parentTreeId));
+    return normalizedWorkspace === treeWritableDir || normalizedWorkspace.startsWith(treeWritableDir + "/");
+  })();
+
+  if (!isSubagentUsingTreeWritable) {
+    const workspaceCheck = await isWorkspaceAllowed(workspace_path);
+    if (!workspaceCheck.allowed) {
+      // SECURITY FIX #5.1: Release reservation on early return
+      pendingReservations.delete(agentId);
+      return {
+        content: [{
+          type: "text" as const,
+          text: `## Workspace path not allowed\n\n**Error:** ${workspaceCheck.reason}`,
+        }],
+        isError: true,
+      };
+    }
   }
 
   // Sanitize task string
@@ -1961,6 +2107,10 @@ async function spawnDockerAgent(args: {
   // PR #32 FIX: Variables declared at function scope for proper cleanup in catch block
   let foregroundLogStream: NodeJS.ReadableStream | null = null;
   let foregroundDemuxer: DockerStreamDemultiplexer | null = null;
+
+  // Issue #90 FIX: Variables declared at function scope for proper cleanup in catch block
+  let treeId: string | null = null;
+  let treeWritableDirsCreated = false;
 
   try {
     // Verify workspace path exists
@@ -2002,6 +2152,18 @@ async function spawnDockerAgent(args: {
     const hasWritablePaths = resolvedWritablePaths.length > 0;
     const accessMode = hasWritablePaths ? "read-only + specific writes" : "read-only";
 
+    // Issue #90: Inject workspace and writable path guidance into task
+    let taskWithGuidance = sanitizedTask;
+    // Always mention /writable/ is available as scratch space
+    taskWithGuidance += `\n\n[SCRATCH SPACE: /writable/ is available for temporary files, builds, and downloads.]`;
+    if (args.workspace_writable) {
+      taskWithGuidance += `\n[WORKSPACE: Read-write mode. You can directly modify files in /workspace.]`;
+    }
+    if (hasWritablePaths) {
+      const relativePaths = resolvedWritablePaths.map(p => path.relative(workspace_path, p));
+      taskWithGuidance += `\n[WRITABLE PATHS: Pre-created at ${relativePaths.map(p => '/writable/' + p).join(', ')}]`;
+    }
+
     console.error(`[pinocchio] Starting agent: ${agentId}`);
     console.error(`[pinocchio] Workspace: ${workspace_path}`);
     console.error(`[pinocchio] Access mode: ${accessMode}`);
@@ -2026,7 +2188,7 @@ async function spawnDockerAgent(args: {
 
     // Build environment variables
     const envVars = [
-      `AGENT_TASK=${sanitizedTask}`,
+      `AGENT_TASK=${taskWithGuidance}`,
       `AGENT_WORKDIR=/workspace`,
       `HOME=/home/agent`,
       `WORKSPACE_MODE=${hasWritablePaths ? "restricted" : "readonly"}`,
@@ -2064,7 +2226,7 @@ async function spawnDockerAgent(args: {
     // Issue #46: Generate treeId for this root agent's spawn tree
     // Issue #49: For child agents, inherit the parent's treeId instead of generating a new one
     // NOTE: Moved before container creation so token can be injected into env vars
-    const treeId = parentTreeId ?? `tree-${crypto.randomUUID()}`;
+    treeId = parentTreeId ?? `tree-${crypto.randomUUID()}`;
 
     // Issue #48: Generate session token for this agent
     // Root agents get tokens that allow them to spawn children (if config permits)
@@ -2085,15 +2247,20 @@ async function spawnDockerAgent(args: {
     if (nestedSpawnConfig.enableRecursiveSpawn &&
         nestingDepth < nestedSpawnConfig.maxNestingDepth) {
       // Inject spawn proxy configuration
-      envVars.push(`PINOCCHIO_API_URL=http://mcp-server:3001`);
+      // Use mcp-server hostname if on docker-proxy network, otherwise use host.docker.internal
+      const apiUrl = allow_docker ? "http://mcp-server:3001" : "http://host.docker.internal:3001";
+      envVars.push(`PINOCCHIO_API_URL=${apiUrl}`);
       envVars.push(`PINOCCHIO_SESSION_TOKEN=${agentSessionToken.token}`);
+      // Pass host workspace path so child agents can be spawned with correct path
+      envVars.push(`PINOCCHIO_HOST_WORKSPACE=${workspace_path}`);
       console.error(`[pinocchio] Injected spawn proxy env vars for agent: ${agentId}`);
     }
 
     // Build bind mounts
-    // Workspace is mounted read-only by default for security
+    // Workspace is mounted read-only by default, read-write when workspace_writable is true
+    const workspaceMode = args.workspace_writable ? 'rw' : 'ro';
     const binds: string[] = [
-      `${workspace_path}:/workspace:ro`,
+      `${workspace_path}:/workspace:${workspaceMode}`,
       // Mount Claude credentials read-only
       `${CONFIG.hostHomePath}/.claude:/tmp/claude-creds:ro`,
     ];
@@ -2109,12 +2276,22 @@ async function spawnDockerAgent(args: {
       binds.push(`${tokenFilePath}:/run/secrets/github_token:ro`);
     }
 
-    // Add writable path mounts (these overlay the read-only workspace)
-    for (const writablePath of resolvedWritablePaths) {
-      // Convert host path to container path
-      const relativePath = path.relative(workspace_path, writablePath);
-      const containerPath = path.join("/workspace", relativePath);
-      binds.push(`${writablePath}:${containerPath}:rw`);
+    // Issue #90: Always mount /writable/ as tree-isolated scratch space
+    // Create the tree writable root directory
+    await createTreeWritableDirs(treeId, []);
+    treeWritableDirsCreated = true;
+
+    // Mount the tree root to /writable/ - always available as scratch space
+    const hostTreeWritableRoot = getHostTreeWritableDir(treeId);
+    binds.push(`${hostTreeWritableRoot}:/writable:rw`);
+    envVars.push(`PINOCCHIO_WRITABLE_ROOT=/writable`);
+    envVars.push(`PINOCCHIO_HOST_WRITABLE_ROOT=${hostTreeWritableRoot}`);
+
+    // If specific writable_paths are requested, create those subdirectories
+    if (resolvedWritablePaths.length > 0) {
+      const relativePaths = resolvedWritablePaths.map(p => path.relative(workspace_path, p));
+      await createTreeWritableDirs(treeId, relativePaths);
+      envVars.push(`PINOCCHIO_WRITABLE_PATHS=${relativePaths.join(':')}`);
     }
 
     // Create container with security hardening
@@ -2136,6 +2313,9 @@ async function spawnDockerAgent(args: {
         // or "none" for fully isolated containers (most secure default).
         NetworkMode: allow_docker ? "pinocchio_docker-proxy" : (allow_network ? "bridge" : "none"),
         SecurityOpt: ["no-new-privileges:true"],
+        // Map host.docker.internal to host gateway for Linux compatibility
+        // This allows containers to reach services on the host (like MCP server on port 3001)
+        ExtraHosts: ["host.docker.internal:host-gateway"],
       },
       WorkingDir: "/workspace",
     });
@@ -2407,6 +2587,9 @@ async function spawnDockerAgent(args: {
       ? `\n**Files Modified:**\n${parsed.filesModified.map(f => `- ${f}`).join("\n")}\n`
       : "";
 
+    // Build writable directory info for the result (always available now)
+    const writableDirRow = `| **Writable Dir** | \`${getHostTreeWritableDir(treeId)}\` |\n`;
+
     return {
       content: [{
         type: "text" as const,
@@ -2417,6 +2600,7 @@ async function spawnDockerAgent(args: {
           `| **Duration** | ${formatDuration(duration)} |\n` +
           `| **Workspace** | ${workspace_path} |\n` +
           `| **Writable Paths** | ${resolvedWritablePaths.length > 0 ? resolvedWritablePaths.length + " paths" : "read-only"} |\n` +
+          writableDirRow +
           filesSection +
           `\n**Summary:**\n${parsed.summary}\n\n` +
           `<details><summary>Full Output</summary>\n\n\`\`\`\n${output}\n\`\`\`\n</details>`,
@@ -2463,6 +2647,11 @@ async function spawnDockerAgent(args: {
     // Use the local variable since metadata may not have been set yet
     if (tokenFilePath) {
       await cleanupTokenFile(tokenFilePath);
+    }
+
+    // Clean up tree writable dirs if spawn fails
+    if (treeWritableDirsCreated && treeId) {
+      await cleanupTreeWritableDir(treeId).catch(() => {});
     }
 
     const errorMessage = error instanceof Error ? error.message : String(error);
