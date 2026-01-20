@@ -214,11 +214,29 @@ function getHostTreeWritableDir(treeId: string): string {
   return path.join(HOST_WRITABLE_BASE_DIR, treeId);
 }
 
+function validateTreeId(treeId: string): void {
+  // Validate treeId format: should be tree-<uuid>
+  const treeIdPattern = /^tree-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  // Also allow legacy format: tree-legacy-<agentId>
+  const legacyPattern = /^tree-legacy-[a-zA-Z0-9_-]+$/;
+
+  if (!treeIdPattern.test(treeId) && !legacyPattern.test(treeId)) {
+    throw new Error(`Invalid treeId format: ${treeId}`);
+  }
+
+  // Reject path traversal attempts
+  if (treeId.includes('..') || treeId.includes('/') || treeId.includes('\\')) {
+    throw new Error(`Invalid treeId: contains path traversal characters: ${treeId}`);
+  }
+}
+
 async function createTreeWritableDirs(treeId: string, relativePaths: string[]): Promise<void> {
+  validateTreeId(treeId);
+
   const treeDir = getTreeWritableDir(treeId);
-  await fs.mkdir(treeDir, { recursive: true, mode: 0o777 });
+  await fs.mkdir(treeDir, { recursive: true, mode: 0o755 });
   // Explicit chmod to override umask which may have masked the mode
-  await fs.chmod(treeDir, 0o777);
+  await fs.chmod(treeDir, 0o755);
 
   for (const relPath of relativePaths) {
     // Defense-in-depth: reject paths with parent traversal
@@ -227,13 +245,15 @@ async function createTreeWritableDirs(treeId: string, relativePaths: string[]): 
       continue;
     }
     const fullPath = path.join(treeDir, relPath);
-    await fs.mkdir(fullPath, { recursive: true, mode: 0o777 });
+    await fs.mkdir(fullPath, { recursive: true, mode: 0o755 });
     // Explicit chmod to override umask which may have masked the mode
-    await fs.chmod(fullPath, 0o777);
+    await fs.chmod(fullPath, 0o755);
   }
 }
 
 export async function cleanupTreeWritableDir(treeId: string): Promise<void> {
+  validateTreeId(treeId);
+
   const treeDir = getTreeWritableDir(treeId);
   try {
     await fs.rm(treeDir, { recursive: true, force: true });

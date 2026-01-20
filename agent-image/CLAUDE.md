@@ -12,8 +12,10 @@ You are running inside an isolated Docker container spawned by Pinocchio.
 ## Your Permissions
 
 Check your task for `[WRITABLE PATHS: ...]`:
-- **Listed paths**: You can modify those files in `/workspace`
-- **No writable paths**: `/workspace` is read-only
+- **Listed paths**: These paths are mounted at `/writable/` (NOT `/workspace/`)
+- **No writable paths**: `/workspace` is read-only, but `/writable/` is always available
+
+**Important**: Writable paths specified in `writable_paths` are mounted under `/writable/`, not directly in `/workspace/`. For example, if your task specifies `writable_paths: ["/workspace/src"]`, you'll find it at `/writable/src/`.
 
 ## Spawning Child Agents
 
