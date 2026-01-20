@@ -958,7 +958,7 @@ async function cascadeTerminateChildren(agentId: string): Promise<void> {
       const result = await terminateWithChildren(
         childId,
         "SIGTERM",
-        updateAgentMetadataForCascade,
+        updateAgentMetadataForTermination,
         runningAgents,
         agentId, // This agent initiated the cascade
         "cascade"
