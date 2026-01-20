@@ -133,30 +133,10 @@ export class PinocchioWebSocket {
    * TCP port is only used as fallback if unixSocket is not configured.
    */
   start(): void {
-    // Issue #50: Create HTTP server with request handler for HTTP endpoints
-    this.httpServer = createServer((req, res) => {
-      this.handleHttpRequest(req, res);
-    });
-
     // Create WebSocket server with noServer option for upgrade handling
     this.wss = new WebSocketServer({
       noServer: true,
       maxPayload: 1024 * 1024, // 1MB max message size
-    });
-
-    // Issue #50: Handle HTTP upgrade requests for WebSocket
-    this.httpServer.on('upgrade', (req, socket, head) => {
-      // Authenticate WebSocket upgrade requests
-      const authorized = this.authenticate(req);
-      if (!authorized) {
-        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-        socket.destroy();
-        return;
-      }
-
-      this.wss!.handleUpgrade(req, socket, head, (ws) => {
-        this.wss!.emit('connection', ws, req);
-      });
     });
 
     // Handle connections
@@ -180,17 +160,7 @@ export class PinocchioWebSocket {
       });
 
       // Handle WebSocket upgrades on Unix socket
-      this.unixServer.on('upgrade', (req, socket, head) => {
-        const authorized = this.authenticate(req);
-        if (!authorized) {
-          socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-          socket.destroy();
-          return;
-        }
-        this.wss!.handleUpgrade(req, socket, head, (ws) => {
-          this.wss!.emit('connection', ws, req);
-        });
-      });
+      this.setupUpgradeHandler(this.unixServer);
 
       this.unixServer.listen(this.config.unixSocket, () => {
         console.error(
@@ -205,6 +175,14 @@ export class PinocchioWebSocket {
       this.registerCleanupHandlers();
     } else {
       // Fallback: TCP port (only if unixSocket is not configured)
+      // Issue #50: Create HTTP server with request handler for HTTP endpoints
+      this.httpServer = createServer((req, res) => {
+        this.handleHttpRequest(req, res);
+      });
+
+      // Handle WebSocket upgrades on HTTP server
+      this.setupUpgradeHandler(this.httpServer);
+
       this.httpServer.listen(this.config.port, this.config.bindAddress, () => {
         console.error(
           `[pinocchio-ws] WebSocket server listening on ${this.config.bindAddress}:${this.config.port}`
@@ -222,6 +200,24 @@ export class PinocchioWebSocket {
 
     // Start heartbeat check
     this.startHeartbeat();
+  }
+
+  /**
+   * Setup WebSocket upgrade handler on an HTTP server.
+   * Extracted to avoid code duplication between UDS and TCP modes.
+   */
+  private setupUpgradeHandler(server: Server): void {
+    server.on('upgrade', (req, socket, head) => {
+      const authorized = this.authenticate(req);
+      if (!authorized) {
+        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      this.wss!.handleUpgrade(req, socket, head, (ws) => {
+        this.wss!.emit('connection', ws, req);
+      });
+    });
   }
 
   /**
