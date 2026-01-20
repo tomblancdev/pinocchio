@@ -45,7 +45,7 @@ services:
       context: .
       dockerfile: Dockerfile
     image: pinocchio:latest
-    # Issue #44: Port 3001 removed - now using Unix Domain Socket at /tmp/pinocchio-{PID}.sock
+    # Issue #44: Port 3001 removed - now using Unix Domain Socket at /tmp/pinocchio/mcp.sock
     # This eliminates port conflicts from stale containers
     depends_on:
       docker-proxy:

@@ -7,7 +7,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { createServer, IncomingMessage, ServerResponse, Server } from 'http';
 import { createServer as createHttpsServer } from 'https';
 import { createConnection } from 'net';
-import { unlinkSync, existsSync, promises as fs } from 'fs';
+import { unlinkSync, existsSync, mkdirSync, promises as fs } from 'fs';
 import { timingSafeEqual } from 'crypto';
 import * as path from 'path';
 import * as os from 'os';
@@ -153,6 +153,9 @@ export class PinocchioWebSocket {
         );
         unlinkSync(this.config.unixSocket);
       }
+
+      // Create parent directory for socket file if it doesn't exist
+      mkdirSync(path.dirname(this.config.unixSocket), { recursive: true });
 
       // Create Unix socket server with HTTP handler
       this.unixServer = createServer((req, res) => {
