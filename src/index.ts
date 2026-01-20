@@ -301,11 +301,13 @@ const DEFAULT_CONFIG: AgentConfig = {
   pendingApprovals: [],
   websocket: {
     enabled: true,
-    port: 3001,
-    bindAddress: '0.0.0.0',  // Allow external connections (for container port mapping)
+    port: 3001,  // Fallback if unixSocket is not set
+    bindAddress: '0.0.0.0',
     auth: 'none',
     subscriptionPolicy: 'open',
     bufferSize: 1000,
+    // Issue #44: Use UDS by default to avoid port conflicts from stale containers
+    unixSocket: process.env.PINOCCHIO_SOCKET_PATH || `/tmp/pinocchio-${process.pid}.sock`,
   },
   // Issue #47: Nested spawn defaults
   nestedSpawn: DEFAULT_NESTED_SPAWN_CONFIG,
@@ -3815,7 +3817,12 @@ async function main() {
       wsServer.setQuotaConfigGetter(getQuotaConfigForHttp);
 
       wsServer.start();
-      console.error('[pinocchio] WebSocket server started on port', config.websocket.port);
+      // Issue #44: Log the actual listening location (UDS or TCP)
+      if (config.websocket.unixSocket) {
+        console.error('[pinocchio] WebSocket server started on Unix socket:', config.websocket.unixSocket);
+      } else {
+        console.error('[pinocchio] WebSocket server started on port', config.websocket.port);
+      }
     } catch (error) {
       console.error('[pinocchio] Failed to start WebSocket server:', error);
     }

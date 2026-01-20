@@ -41,5 +41,5 @@ EOF
 fi
 
 # Run the MCP server container with stdio attached
-# --service-ports ensures WebSocket port (3001) is published
-exec docker compose run --rm -T --service-ports mcp-server
+# Issue #44: WebSocket now uses Unix Domain Socket (no port needed)
+exec docker compose run --rm -T mcp-server

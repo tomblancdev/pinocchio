@@ -24,11 +24,13 @@ export interface WebSocketConfig {
 
 export const DEFAULT_WEBSOCKET_CONFIG: WebSocketConfig = {
   enabled: true,
-  port: 3001,
+  port: 3001,  // Only used if unixSocket is not set
   bindAddress: '127.0.0.1',
   auth: 'none',
   subscriptionPolicy: 'open',
   bufferSize: 1000,
+  // Issue #44: Use UDS by default to avoid port conflicts
+  unixSocket: process.env.PINOCCHIO_SOCKET_PATH || `/tmp/pinocchio-${process.pid}.sock`,
 };
 
 // ============================================================================

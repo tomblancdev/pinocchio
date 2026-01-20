@@ -45,8 +45,8 @@ services:
       context: .
       dockerfile: Dockerfile
     image: pinocchio:latest
-    ports:
-      - "3001:3001"  # WebSocket server
+    # Issue #44: Port 3001 removed - now using Unix Domain Socket at /tmp/pinocchio-{PID}.sock
+    # This eliminates port conflicts from stale containers
     depends_on:
       docker-proxy:
         condition: service_healthy
