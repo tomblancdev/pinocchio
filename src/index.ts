@@ -2293,6 +2293,9 @@ async function spawnDockerAgent(args: {
         // or "none" for fully isolated containers (most secure default).
         NetworkMode: allow_docker ? "pinocchio_docker-proxy" : (allow_network ? "bridge" : "none"),
         SecurityOpt: ["no-new-privileges:true"],
+        // Map host.docker.internal to host gateway for Linux compatibility
+        // This allows containers to reach services on the host (like MCP server on port 3001)
+        ExtraHosts: ["host.docker.internal:host-gateway"],
       },
       WorkingDir: "/workspace",
     });
