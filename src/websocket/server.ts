@@ -7,7 +7,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { createServer, IncomingMessage, ServerResponse, Server } from 'http';
 import { createServer as createHttpsServer } from 'https';
 import { createConnection } from 'net';
-import { unlinkSync, existsSync, promises as fs } from 'fs';
+import { unlinkSync, existsSync, mkdirSync, chmodSync, promises as fs } from 'fs';
 import { timingSafeEqual } from 'crypto';
 import * as path from 'path';
 import * as os from 'os';
@@ -124,34 +124,19 @@ export class PinocchioWebSocket {
     console.error('[pinocchio-ws] Quota config getter registered');
   }
 
+  // Issue #44: Track Unix socket server for cleanup
+  private unixServer: Server | null = null;
+
   /**
    * Start the WebSocket server.
+   * Issue #44: UDS (Unix Domain Socket) is now the primary listening mode.
+   * TCP port is only used as fallback if unixSocket is not configured.
    */
   start(): void {
-    // Issue #50: Create HTTP server with request handler for HTTP endpoints
-    this.httpServer = createServer((req, res) => {
-      this.handleHttpRequest(req, res);
-    });
-
     // Create WebSocket server with noServer option for upgrade handling
     this.wss = new WebSocketServer({
       noServer: true,
       maxPayload: 1024 * 1024, // 1MB max message size
-    });
-
-    // Issue #50: Handle HTTP upgrade requests for WebSocket
-    this.httpServer.on('upgrade', (req, socket, head) => {
-      // Authenticate WebSocket upgrade requests
-      const authorized = this.authenticate(req);
-      if (!authorized) {
-        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-        socket.destroy();
-        return;
-      }
-
-      this.wss!.handleUpgrade(req, socket, head, (ws) => {
-        this.wss!.emit('connection', ws, req);
-      });
     });
 
     // Handle connections
@@ -159,31 +144,59 @@ export class PinocchioWebSocket {
       this.handleConnection(ws, req);
     });
 
-    // Start listening on TCP port
-    this.httpServer.listen(this.config.port, this.config.bindAddress, () => {
-      console.error(
-        `[pinocchio-ws] WebSocket server listening on ${this.config.bindAddress}:${this.config.port}`
-      );
-      console.error(
-        `[pinocchio-ws] HTTP endpoints available: GET /health, POST /api/v1/spawn`
-      );
-    });
-
-    // Optionally listen on Unix socket
+    // Issue #44: Use Unix Domain Socket as primary listener to avoid port conflicts
     if (this.config.unixSocket) {
-      // Remove existing socket file
+      // Clean up stale socket file (from crashed processes)
       if (existsSync(this.config.unixSocket)) {
+        console.error(
+          `[pinocchio-ws] Cleaning up stale socket file: ${this.config.unixSocket}`
+        );
         unlinkSync(this.config.unixSocket);
       }
 
-      const unixServer = createServer();
-      const unixWss = new WebSocketServer({ server: unixServer });
-      unixWss.on('connection', (ws, req) => {
-        this.handleConnection(ws, req);
+      // Create parent directory for socket file if it doesn't exist
+      mkdirSync(path.dirname(this.config.unixSocket), { recursive: true });
+
+      // Create Unix socket server with HTTP handler
+      this.unixServer = createServer((req, res) => {
+        this.handleHttpRequest(req, res);
       });
-      unixServer.listen(this.config.unixSocket, () => {
+
+      // Handle WebSocket upgrades on Unix socket
+      this.setupUpgradeHandler(this.unixServer);
+
+      const socketPath = this.config.unixSocket;
+      this.unixServer.listen(socketPath, () => {
+        // Set socket permissions to allow non-root agents (UID 1000) to connect
+        if (socketPath) {
+          chmodSync(socketPath, 0o777);
+        }
         console.error(
-          `[pinocchio-ws] WebSocket server listening on ${this.config.unixSocket}`
+          `[pinocchio-ws] WebSocket server listening on Unix socket: ${socketPath}`
+        );
+        console.error(
+          `[pinocchio-ws] HTTP endpoints available: GET /health, POST /api/v1/spawn`
+        );
+      });
+
+      // Issue #44: Register cleanup handlers for process exit
+      this.registerCleanupHandlers();
+    } else {
+      // Fallback: TCP port (only if unixSocket is not configured)
+      // Issue #50: Create HTTP server with request handler for HTTP endpoints
+      this.httpServer = createServer((req, res) => {
+        this.handleHttpRequest(req, res);
+      });
+
+      // Handle WebSocket upgrades on HTTP server
+      this.setupUpgradeHandler(this.httpServer);
+
+      this.httpServer.listen(this.config.port, this.config.bindAddress, () => {
+        console.error(
+          `[pinocchio-ws] WebSocket server listening on ${this.config.bindAddress}:${this.config.port}`
+        );
+        console.error(
+          `[pinocchio-ws] HTTP endpoints available: GET /health, POST /api/v1/spawn`
         );
       });
     }
@@ -195,6 +208,61 @@ export class PinocchioWebSocket {
 
     // Start heartbeat check
     this.startHeartbeat();
+  }
+
+  /**
+   * Setup WebSocket upgrade handler on an HTTP server.
+   * Extracted to avoid code duplication between UDS and TCP modes.
+   */
+  private setupUpgradeHandler(server: Server): void {
+    server.on('upgrade', (req, socket, head) => {
+      const authorized = this.authenticate(req);
+      if (!authorized) {
+        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      this.wss!.handleUpgrade(req, socket, head, (ws) => {
+        this.wss!.emit('connection', ws, req);
+      });
+    });
+  }
+
+  /**
+   * Issue #44: Register cleanup handlers to remove socket file on process exit.
+   * This handles SIGINT, SIGTERM, and uncaught exceptions.
+   */
+  private registerCleanupHandlers(): void {
+    const cleanup = () => {
+      if (this.config.unixSocket && existsSync(this.config.unixSocket)) {
+        try {
+          unlinkSync(this.config.unixSocket);
+          console.error(`[pinocchio-ws] Cleaned up socket file: ${this.config.unixSocket}`);
+        } catch (err) {
+          // Ignore errors during cleanup
+        }
+      }
+    };
+
+    // Handle graceful shutdown signals
+    process.once('SIGINT', () => {
+      cleanup();
+      process.exit(0);
+    });
+    process.once('SIGTERM', () => {
+      cleanup();
+      process.exit(0);
+    });
+
+    // Handle uncaught exceptions (last resort cleanup)
+    process.once('uncaughtException', (err) => {
+      console.error('[pinocchio-ws] Uncaught exception:', err);
+      cleanup();
+      process.exit(1);
+    });
+
+    // Handle process.exit() calls
+    process.once('exit', cleanup);
   }
 
   /**
@@ -482,12 +550,30 @@ export class PinocchioWebSocket {
       this.wss = null;
     }
 
-    // Close HTTP server
+    // Close HTTP server (TCP)
     if (this.httpServer) {
       await new Promise<void>((resolve) => {
         this.httpServer!.close(() => resolve());
       });
       this.httpServer = null;
+    }
+
+    // Issue #44: Close Unix socket server and clean up socket file
+    if (this.unixServer) {
+      await new Promise<void>((resolve) => {
+        this.unixServer!.close(() => resolve());
+      });
+      this.unixServer = null;
+    }
+
+    // Clean up socket file
+    if (this.config.unixSocket && existsSync(this.config.unixSocket)) {
+      try {
+        unlinkSync(this.config.unixSocket);
+        console.error(`[pinocchio-ws] Cleaned up socket file: ${this.config.unixSocket}`);
+      } catch (err) {
+        // Ignore errors during cleanup
+      }
     }
 
     console.error('[pinocchio-ws] WebSocket server closed');

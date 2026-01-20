@@ -45,8 +45,8 @@ services:
       context: .
       dockerfile: Dockerfile
     image: pinocchio:latest
-    ports:
-      - "3001:3001"  # WebSocket server
+    # Issue #44: Port 3001 removed - now using Unix Domain Socket at /tmp/pinocchio/mcp.sock
+    # This eliminates port conflicts from stale containers
     depends_on:
       docker-proxy:
         condition: service_healthy
@@ -59,6 +59,8 @@ services:
       - ${HOST_CONFIG_DIR:-~/.config/pinocchio}:/root/.config/pinocchio:rw
       # GitHub CLI config (for gh commands in agents)
       - ${HOST_GH_CONFIG:-~/.config/gh}:/root/.config/gh:ro
+      # Share socket directory with host for nested agent access
+      - /tmp/pinocchio:/tmp/pinocchio:rw
     networks:
       - docker-proxy
     stdin_open: true

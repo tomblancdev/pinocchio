@@ -301,11 +301,14 @@ const DEFAULT_CONFIG: AgentConfig = {
   pendingApprovals: [],
   websocket: {
     enabled: true,
-    port: 3001,
-    bindAddress: '0.0.0.0',  // Allow external connections (for container port mapping)
+    port: 3001,  // Fallback if unixSocket is not set
+    bindAddress: '0.0.0.0',
     auth: 'none',
     subscriptionPolicy: 'open',
     bufferSize: 1000,
+    // Issue #44: Use UDS by default to avoid port conflicts from stale containers
+    // Issue #96: Fixed path so nested agents can find the socket via shared volume
+    unixSocket: process.env.PINOCCHIO_SOCKET_PATH || '/tmp/pinocchio/mcp.sock',
   },
   // Issue #47: Nested spawn defaults
   nestedSpawn: DEFAULT_NESTED_SPAWN_CONFIG,
@@ -323,7 +326,17 @@ interface AuditEvent {
 async function loadConfig(): Promise<AgentConfig> {
   try {
     const data = await fs.readFile(CONFIG_FILE, "utf-8");
-    return { ...DEFAULT_CONFIG, ...JSON.parse(data) };
+    const persisted = JSON.parse(data);
+    // Deep merge websocket config to preserve defaults like unixSocket
+    // when existing configs don't have the new field
+    return {
+      ...DEFAULT_CONFIG,
+      ...persisted,
+      websocket: {
+        ...DEFAULT_CONFIG.websocket,
+        ...persisted.websocket,
+      },
+    };
   } catch {
     return DEFAULT_CONFIG;
   }
@@ -956,7 +969,7 @@ async function cascadeTerminateChildren(agentId: string): Promise<void> {
       const result = await terminateWithChildren(
         childId,
         "SIGTERM",
-        updateAgentMetadataForCascade,
+        updateAgentMetadataForTermination,
         runningAgents,
         agentId, // This agent initiated the cascade
         "cascade"
@@ -2278,12 +2291,11 @@ async function spawnDockerAgent(args: {
     storeSessionToken(agentSessionToken);
 
     // Issue #57: Inject spawn proxy environment variables if agent can spawn children
+    // Issue #96: Use UDS socket path instead of HTTP URL for nested agent communication
     if (nestedSpawnConfig.enableRecursiveSpawn &&
         nestingDepth < nestedSpawnConfig.maxNestingDepth) {
-      // Inject spawn proxy configuration
-      // Use mcp-server hostname if on docker-proxy network, otherwise use host.docker.internal
-      const apiUrl = allow_docker ? "http://mcp-server:3001" : "http://host.docker.internal:3001";
-      envVars.push(`PINOCCHIO_API_URL=${apiUrl}`);
+      // Inject spawn proxy configuration using UDS socket path
+      envVars.push(`PINOCCHIO_API_SOCKET=/tmp/pinocchio/mcp.sock`);
       envVars.push(`PINOCCHIO_SESSION_TOKEN=${agentSessionToken.token}`);
       // Pass host workspace path so child agents can be spawned with correct path
       envVars.push(`PINOCCHIO_HOST_WORKSPACE=${workspace_path}`);
@@ -2298,6 +2310,12 @@ async function spawnDockerAgent(args: {
       // Mount Claude credentials read-only
       `${CONFIG.hostHomePath}/.claude:/tmp/claude-creds:ro`,
     ];
+
+    // Issue #96: Mount socket directory so nested agents can communicate via UDS
+    if (nestedSpawnConfig.enableRecursiveSpawn &&
+        nestingDepth < nestedSpawnConfig.maxNestingDepth) {
+      binds.push('/tmp/pinocchio:/tmp/pinocchio:rw');
+    }
 
     // Mount gh CLI config if GitHub access is needed and no token is set
     if (github_access !== "none" && !config.github?.token) {
@@ -3815,7 +3833,12 @@ async function main() {
       wsServer.setQuotaConfigGetter(getQuotaConfigForHttp);
 
       wsServer.start();
-      console.error('[pinocchio] WebSocket server started on port', config.websocket.port);
+      // Issue #44: Log the actual listening location (UDS or TCP)
+      if (config.websocket.unixSocket) {
+        console.error('[pinocchio] WebSocket server started on Unix socket:', config.websocket.unixSocket);
+      } else {
+        console.error('[pinocchio] WebSocket server started on port', config.websocket.port);
+      }
     } catch (error) {
       console.error('[pinocchio] Failed to start WebSocket server:', error);
     }
