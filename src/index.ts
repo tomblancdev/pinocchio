@@ -307,7 +307,8 @@ const DEFAULT_CONFIG: AgentConfig = {
     subscriptionPolicy: 'open',
     bufferSize: 1000,
     // Issue #44: Use UDS by default to avoid port conflicts from stale containers
-    unixSocket: process.env.PINOCCHIO_SOCKET_PATH || `/tmp/pinocchio-${process.pid}.sock`,
+    // Issue #96: Fixed path so nested agents can find the socket via shared volume
+    unixSocket: process.env.PINOCCHIO_SOCKET_PATH || '/tmp/pinocchio/mcp.sock',
   },
   // Issue #47: Nested spawn defaults
   nestedSpawn: DEFAULT_NESTED_SPAWN_CONFIG,
@@ -2290,12 +2291,11 @@ async function spawnDockerAgent(args: {
     storeSessionToken(agentSessionToken);
 
     // Issue #57: Inject spawn proxy environment variables if agent can spawn children
+    // Issue #96: Use UDS socket path instead of HTTP URL for nested agent communication
     if (nestedSpawnConfig.enableRecursiveSpawn &&
         nestingDepth < nestedSpawnConfig.maxNestingDepth) {
-      // Inject spawn proxy configuration
-      // Use mcp-server hostname if on docker-proxy network, otherwise use host.docker.internal
-      const apiUrl = allow_docker ? "http://mcp-server:3001" : "http://host.docker.internal:3001";
-      envVars.push(`PINOCCHIO_API_URL=${apiUrl}`);
+      // Inject spawn proxy configuration using UDS socket path
+      envVars.push(`PINOCCHIO_API_SOCKET=/tmp/pinocchio/mcp.sock`);
       envVars.push(`PINOCCHIO_SESSION_TOKEN=${agentSessionToken.token}`);
       // Pass host workspace path so child agents can be spawned with correct path
       envVars.push(`PINOCCHIO_HOST_WORKSPACE=${workspace_path}`);
@@ -2310,6 +2310,12 @@ async function spawnDockerAgent(args: {
       // Mount Claude credentials read-only
       `${CONFIG.hostHomePath}/.claude:/tmp/claude-creds:ro`,
     ];
+
+    // Issue #96: Mount socket directory so nested agents can communicate via UDS
+    if (nestedSpawnConfig.enableRecursiveSpawn &&
+        nestingDepth < nestedSpawnConfig.maxNestingDepth) {
+      binds.push('/tmp/pinocchio:/tmp/pinocchio:rw');
+    }
 
     // Mount gh CLI config if GitHub access is needed and no token is set
     if (github_access !== "none" && !config.github?.token) {

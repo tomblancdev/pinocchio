@@ -7,7 +7,8 @@
  * a `spawn_agent` tool that Claude CLI can call to spawn child agents.
  *
  * Environment variables:
- * - PINOCCHIO_API_URL: URL of the Pinocchio HTTP API (e.g., http://host:3001)
+ * - PINOCCHIO_API_SOCKET: Path to the Unix Domain Socket (preferred, e.g., /tmp/pinocchio/mcp.sock)
+ * - PINOCCHIO_API_URL: URL of the Pinocchio HTTP API (fallback, e.g., http://host:3001)
  * - PINOCCHIO_SESSION_TOKEN: Authentication token for the parent agent session
  */
 
@@ -17,15 +18,18 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import http from "http";
 
 // Environment configuration
+// Issue #96: Prefer UDS socket path, fall back to HTTP URL for backwards compatibility
+const PINOCCHIO_API_SOCKET = process.env.PINOCCHIO_API_SOCKET;
 const PINOCCHIO_API_URL = process.env.PINOCCHIO_API_URL;
 const PINOCCHIO_SESSION_TOKEN = process.env.PINOCCHIO_SESSION_TOKEN;
 const PINOCCHIO_HOST_WORKSPACE = process.env.PINOCCHIO_HOST_WORKSPACE;
 
 // Validate required environment variables
-if (!PINOCCHIO_API_URL) {
-  console.error("[spawn-proxy] Error: PINOCCHIO_API_URL environment variable is required");
+if (!PINOCCHIO_API_SOCKET && !PINOCCHIO_API_URL) {
+  console.error("[spawn-proxy] Error: Either PINOCCHIO_API_SOCKET or PINOCCHIO_API_URL environment variable is required");
   process.exit(1);
 }
 
@@ -110,34 +114,100 @@ interface SpawnErrorResponse {
 }
 
 /**
- * Spawn a child agent by calling the Pinocchio HTTP API
+ * Make HTTP request via Unix Domain Socket
+ * Issue #96: Use UDS for nested agent communication
+ */
+function httpRequestViaUDS(
+  socketPath: string,
+  path: string,
+  method: string,
+  headers: Record<string, string>,
+  body: string
+): Promise<{ statusCode: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const options: http.RequestOptions = {
+      socketPath,
+      path,
+      method,
+      headers: {
+        ...headers,
+        "Content-Length": Buffer.byteLength(body),
+      },
+    };
+
+    const req = http.request(options, (res) => {
+      let data = "";
+      res.on("data", (chunk) => {
+        data += chunk;
+      });
+      res.on("end", () => {
+        resolve({ statusCode: res.statusCode || 500, body: data });
+      });
+    });
+
+    req.on("error", (err) => {
+      reject(err);
+    });
+
+    req.write(body);
+    req.end();
+  });
+}
+
+/**
+ * Spawn a child agent by calling the Pinocchio API
+ * Issue #96: Prefer UDS socket, fall back to HTTP URL for backwards compatibility
  */
 async function spawnChildAgent(args: SpawnRequest): Promise<{
   content: Array<{ type: "text"; text: string }>;
   isError?: boolean;
 }> {
-  const url = `${PINOCCHIO_API_URL}/api/v1/spawn`;
+  const requestBody = JSON.stringify({
+    task: args.task,
+    // Use host workspace path from environment, or fall back to provided path
+    workspace_path: args.workspace_path || PINOCCHIO_HOST_WORKSPACE,
+    writable_paths: args.writable_paths,
+    timeout_ms: args.timeout_ms,
+  });
+
+  const headers = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${PINOCCHIO_SESSION_TOKEN}`,
+  };
 
   try {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${PINOCCHIO_SESSION_TOKEN}`,
-      },
-      body: JSON.stringify({
-        task: args.task,
-        // Use host workspace path from environment, or fall back to provided path
-        workspace_path: args.workspace_path || PINOCCHIO_HOST_WORKSPACE,
-        writable_paths: args.writable_paths,
-        timeout_ms: args.timeout_ms,
-      }),
-    });
+    let responseData: { statusCode: number; body: string };
 
-    if (!response.ok) {
-      const errorBody = (await response.json().catch(() => ({
-        error: response.statusText,
-      }))) as SpawnErrorResponse;
+    if (PINOCCHIO_API_SOCKET) {
+      // Use Unix Domain Socket
+      responseData = await httpRequestViaUDS(
+        PINOCCHIO_API_SOCKET,
+        "/api/v1/spawn",
+        "POST",
+        headers,
+        requestBody
+      );
+    } else {
+      // Fallback to HTTP URL
+      const url = `${PINOCCHIO_API_URL}/api/v1/spawn`;
+      const response = await fetch(url, {
+        method: "POST",
+        headers,
+        body: requestBody,
+      });
+      responseData = {
+        statusCode: response.status,
+        body: await response.text(),
+      };
+    }
+
+    if (responseData.statusCode < 200 || responseData.statusCode >= 300) {
+      let errorBody: SpawnErrorResponse;
+      try {
+        errorBody = JSON.parse(responseData.body) as SpawnErrorResponse;
+      } catch {
+        errorBody = { error: `HTTP ${responseData.statusCode}` };
+      }
 
       // Format quota errors specially
       if (errorBody.max_depth !== undefined || errorBody.max_agents !== undefined) {
@@ -158,14 +228,14 @@ async function spawnChildAgent(args: SpawnRequest): Promise<{
         content: [
           {
             type: "text",
-            text: `Failed to spawn child agent: ${errorBody.error || response.statusText}`,
+            text: `Failed to spawn child agent: ${errorBody.error}`,
           },
         ],
         isError: true,
       };
     }
 
-    const result = (await response.json()) as SpawnResponse;
+    const result = JSON.parse(responseData.body) as SpawnResponse;
 
     // Format successful response
     let output = `Child agent ${result.agent_id} ${result.status}\n`;

@@ -30,7 +30,8 @@ export const DEFAULT_WEBSOCKET_CONFIG: WebSocketConfig = {
   subscriptionPolicy: 'open',
   bufferSize: 1000,
   // Issue #44: Use UDS by default to avoid port conflicts
-  unixSocket: process.env.PINOCCHIO_SOCKET_PATH || `/tmp/pinocchio-${process.pid}.sock`,
+  // Issue #96: Fixed path so nested agents can find the socket via shared volume
+  unixSocket: process.env.PINOCCHIO_SOCKET_PATH || '/tmp/pinocchio/mcp.sock',
 };
 
 // ============================================================================

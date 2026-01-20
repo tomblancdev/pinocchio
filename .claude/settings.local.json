@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__pinocchio__get_agent_status",
+      "Bash(gh issue view:*)"
+    ]
+  }
+}
