@@ -26,6 +26,10 @@ cp "$CREDS_DIR/.credentials.json" "$CLAUDE_DIR/"
 
 export CLAUDE_CONFIG_DIR="$CLAUDE_DIR"
 
+# Set HOME to a writable location (container may run as host UID, not 'agent' user)
+export HOME="/tmp/agent-home"
+mkdir -p "$HOME"
+
 # Set cache directory to writable location (fixes UID mismatch)
 export XDG_CACHE_HOME="/tmp/cache"
 mkdir -p "$XDG_CACHE_HOME"
@@ -54,6 +58,29 @@ fi
 # Optional: Change to specific directory if provided
 if [ -n "$AGENT_WORKDIR" ] && [ -d "$AGENT_WORKDIR" ]; then
     cd "$AGENT_WORKDIR"
+fi
+
+# Configure spawn proxy MCP server for nested agent spawning
+if [ -n "$PINOCCHIO_API_URL" ] && [ -n "$PINOCCHIO_SESSION_TOKEN" ]; then
+    MCP_CONFIG_DIR="/tmp/claude-mcp-config"
+    mkdir -p "$MCP_CONFIG_DIR"
+    export CLAUDE_MCP_SERVERS_DIR="$MCP_CONFIG_DIR"
+    cat > "$MCP_CONFIG_DIR/mcp_servers.json" << EOF
+{
+  "spawn-proxy": {
+    "command": "/usr/local/bin/spawn-proxy",
+    "args": [],
+    "env": {
+      "PINOCCHIO_API_URL": "$PINOCCHIO_API_URL",
+      "PINOCCHIO_SESSION_TOKEN": "$PINOCCHIO_SESSION_TOKEN",
+      "PINOCCHIO_HOST_WORKSPACE": "$PINOCCHIO_HOST_WORKSPACE"
+    }
+  }
+}
+EOF
+    echo "[entrypoint] Spawn proxy MCP server configured"
+else
+    echo "[entrypoint] Spawn proxy not configured (PINOCCHIO_API_URL or PINOCCHIO_SESSION_TOKEN not set)"
 fi
 
 echo "╔══════════════════════════════════════════╗"

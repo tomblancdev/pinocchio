@@ -40,12 +40,22 @@ export type AgentEventType =
   | 'agent.log'
   | 'agent.progress'
   | 'agent.completed'
-  | 'agent.failed';
+  | 'agent.failed'
+  | 'agent.terminated';
 
+/**
+ * Base event with hierarchy info
+ * Issue #62: All events include hierarchy fields for parent-child tracking
+ */
 export interface BaseAgentEvent {
   type: AgentEventType;
   agentId: string;
   timestamp: string;
+
+  // Hierarchy fields (Issue #62)
+  parentAgentId?: string;  // undefined for root agents
+  treeId: string;          // Spawn tree identifier
+  depth: number;           // Nesting depth (0 for root)
 }
 
 export interface AgentStartedEvent extends BaseAgentEvent {
@@ -53,6 +63,7 @@ export interface AgentStartedEvent extends BaseAgentEvent {
   data: {
     task: string;
     workspace: string;
+    writablePaths: string[];
   };
 }
 
@@ -78,17 +89,30 @@ export interface AgentCompletedEvent extends BaseAgentEvent {
   type: 'agent.completed';
   data: {
     exitCode: number;
-    duration: number;
-    filesModified: string[];
+    output: string;
+    durationMs: number;
+    filesModified?: string[];
   };
 }
 
 export interface AgentFailedEvent extends BaseAgentEvent {
   type: 'agent.failed';
   data: {
-    exitCode?: number;
+    exitCode: number;
     error: string;
-    duration?: number;
+    output?: string;
+  };
+}
+
+/**
+ * Event emitted when an agent is terminated (Issue #62)
+ * Reasons include cascade termination, manual termination, timeout, or orphan cleanup
+ */
+export interface AgentTerminatedEvent extends BaseAgentEvent {
+  type: 'agent.terminated';
+  data: {
+    reason: 'cascade' | 'manual' | 'timeout' | 'orphan_cleanup';
+    terminatedBy?: string;  // Agent that triggered cascade
   };
 }
 
@@ -97,7 +121,8 @@ export type AgentEvent =
   | AgentLogEvent
   | AgentProgressEvent
   | AgentCompletedEvent
-  | AgentFailedEvent;
+  | AgentFailedEvent
+  | AgentTerminatedEvent;
 
 // ============================================================================
 // Client -> Server Messages
@@ -107,13 +132,15 @@ export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
 export interface SubscribeMessage {
   type: 'subscribe';
-  agentId: string; // '*' for all agents
+  agentId?: string; // '*' for all agents, optional if treeId is provided
+  treeId?: string;  // Issue #63: Subscribe to all agents in a spawn tree
   logLevels?: LogLevel[]; // Optional filter, defaults to all levels
 }
 
 export interface UnsubscribeMessage {
   type: 'unsubscribe';
-  agentId: string;
+  agentId?: string;
+  treeId?: string;  // Issue #63: Unsubscribe from tree-level subscription
 }
 
 export interface PingMessage {
@@ -128,12 +155,14 @@ export type ClientMessage = SubscribeMessage | UnsubscribeMessage | PingMessage;
 
 export interface SubscribedMessage {
   type: 'subscribed';
-  agentId: string;
+  agentId?: string;
+  treeId?: string;  // Issue #63: Tree-level subscription confirmation
 }
 
 export interface UnsubscribedMessage {
   type: 'unsubscribed';
-  agentId: string;
+  agentId?: string;
+  treeId?: string;  // Issue #63: Tree-level unsubscription confirmation
 }
 
 export interface ErrorMessage {
@@ -190,10 +219,16 @@ export function isClientMessage(data: unknown): data is ClientMessage {
   const msg = data as Record<string, unknown>;
   if (msg.type === 'ping') return true;
   if (msg.type === 'unsubscribe') {
-    return typeof msg.agentId === 'string' && msg.agentId.length > 0;
+    // Issue #63: Must have either agentId or treeId (or both)
+    const hasAgentId = typeof msg.agentId === 'string' && msg.agentId.length > 0;
+    const hasTreeId = typeof msg.treeId === 'string' && msg.treeId.length > 0;
+    return hasAgentId || hasTreeId;
   }
   if (msg.type === 'subscribe') {
-    if (typeof msg.agentId !== 'string' || msg.agentId.length === 0) {
+    // Issue #63: Must have either agentId or treeId (or both)
+    const hasAgentId = typeof msg.agentId === 'string' && msg.agentId.length > 0;
+    const hasTreeId = typeof msg.treeId === 'string' && msg.treeId.length > 0;
+    if (!hasAgentId && !hasTreeId) {
       return false;
     }
     // logLevels is optional, but if provided must be valid
@@ -214,4 +249,183 @@ export function isAgentEvent(data: unknown): data is AgentEvent {
     typeof event.agentId === 'string' &&
     typeof event.timestamp === 'string'
   );
+}
+
+// ============================================================================
+// Issue #50: HTTP Spawn Endpoint Types
+// ============================================================================
+
+/**
+ * Request body for POST /api/v1/spawn
+ */
+export interface SpawnRequest {
+  task: string;
+  workspace_path?: string;
+  writable_paths?: string[];
+  timeout_ms?: number;
+}
+
+/**
+ * Quota information returned with successful spawn responses
+ * Issue #53: Depth limit and tree agent quota
+ */
+export interface QuotaInfo {
+  tree_agents_remaining: number;
+  depth_remaining: number;
+}
+
+/**
+ * Successful response from POST /api/v1/spawn
+ */
+export interface SpawnResponse {
+  agent_id: string;
+  status: 'completed' | 'failed' | 'timeout';
+  exit_code: number;
+  output: string;
+  duration_ms: number;
+  files_modified?: string[];
+  error?: string;
+  quota_info?: QuotaInfo;
+}
+
+/**
+ * Error response from POST /api/v1/spawn
+ */
+export interface SpawnErrorResponse {
+  error: string;
+}
+
+/**
+ * Issue #53: Quota enforcement error responses
+ */
+export interface QuotaErrorResponse {
+  error: string;
+  current_depth?: number;
+  max_depth?: number;
+  current_count?: number;
+  max_agents?: number;
+}
+
+/**
+ * Session token with permissions (simplified view for HTTP handler)
+ */
+export interface SessionTokenInfo {
+  agentId: string;
+  treeId: string;
+  parentAgentId?: string;
+  depth: number;
+  maxDepth: number;
+  expiresAt: number;
+  permissions: {
+    canSpawn: boolean;
+    inheritGitHubToken: boolean;
+  };
+}
+
+/**
+ * Result of session token validation
+ */
+export interface TokenValidationResult {
+  valid: boolean;
+  token?: SessionTokenInfo;
+  error?: string;
+}
+
+/**
+ * Internal spawn arguments passed to the spawn handler
+ */
+export interface SpawnHandlerArgs {
+  task: string;
+  workspace_path: string;
+  writable_paths?: string[];
+  timeout_ms?: number;
+  parent_agent_id: string;
+  // Child spawns are always blocking (background: false)
+}
+
+/**
+ * Result from the spawn handler
+ */
+export interface SpawnHandlerResult {
+  success: boolean;
+  agent_id?: string;
+  status?: 'completed' | 'failed' | 'timeout';
+  exit_code?: number;
+  output?: string;
+  duration_ms?: number;
+  files_modified?: string[];
+  error?: string;
+}
+
+/**
+ * Handler function type for spawning agents
+ */
+export type SpawnHandler = (args: SpawnHandlerArgs) => Promise<SpawnHandlerResult>;
+
+/**
+ * Handler function type for validating session tokens
+ */
+export type TokenValidator = (token: string) => TokenValidationResult;
+
+/**
+ * Issue #53: Spawn tree info for quota enforcement
+ */
+export interface SpawnTreeInfo {
+  treeId: string;
+  totalAgents: number;
+  status: 'active' | 'terminated';
+}
+
+/**
+ * Issue #53: Quota configuration
+ */
+export interface QuotaConfig {
+  maxAgentsPerTree: number;
+  maxConcurrentAgents: number;
+}
+
+/**
+ * Issue #53: Handler function type for getting spawn tree info
+ */
+export type TreeInfoGetter = (treeId: string) => SpawnTreeInfo | undefined;
+
+/**
+ * Issue #53: Handler function type for getting running agent count
+ */
+export type RunningAgentCounter = () => number;
+
+/**
+ * Issue #53: Handler function type for getting quota config
+ */
+export type QuotaConfigGetter = () => QuotaConfig;
+
+/**
+ * Type guard for SpawnRequest
+ */
+export function isSpawnRequest(data: unknown): data is SpawnRequest {
+  if (typeof data !== 'object' || data === null) return false;
+  const req = data as Record<string, unknown>;
+
+  // task is required and must be a non-empty string
+  if (typeof req.task !== 'string' || req.task.trim().length === 0) {
+    return false;
+  }
+
+  // workspace_path is optional, but if provided must be a string
+  if (req.workspace_path !== undefined && typeof req.workspace_path !== 'string') {
+    return false;
+  }
+
+  // writable_paths is optional, but if provided must be an array of strings
+  if (req.writable_paths !== undefined) {
+    if (!Array.isArray(req.writable_paths)) return false;
+    if (!req.writable_paths.every(p => typeof p === 'string')) return false;
+  }
+
+  // timeout_ms is optional, but if provided must be a positive number
+  if (req.timeout_ms !== undefined) {
+    if (typeof req.timeout_ms !== 'number' || req.timeout_ms <= 0) return false;
+  }
+
+  return true;
 }

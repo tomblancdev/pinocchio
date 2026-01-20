@@ -14,10 +14,31 @@ import * as path from "path";
 import * as fs from "fs/promises";
 import { glob } from "glob";
 import * as crypto from "crypto";
-import { EventBus } from './websocket/events.js';
+import { EventBus, eventBus } from './websocket/events.js';
 import { PinocchioWebSocket } from './websocket/server.js';
-import { WebSocketConfig } from './websocket/types.js';
+import { WebSocketConfig, SpawnHandlerArgs, SpawnHandlerResult, TokenValidationResult as WsTokenValidationResult } from './websocket/types.js';
 import { ProgressTracker } from './websocket/progress.js';
+import {
+  initSessionManager,
+  generateSessionToken as generateToken,
+  storeSessionToken,
+  getSessionToken,
+  validateSessionToken,
+  invalidateSessionToken,
+  invalidateTokensForAgent,
+  invalidateTokensForTree,
+  saveTokenState as saveSessionTokenState,
+  loadTokenState as loadSessionTokenState,
+  startTokenCleanup,
+  stopTokenCleanup,
+  SessionToken,
+  TokenValidationResult,
+} from './session/index.js';
+import {
+  terminateWithChildren,
+  terminateTree,
+  CascadeTerminationResult,
+} from './lifecycle/index.js';
 
 // PR #32 FIX: Docker stream demultiplexer
 // Docker multiplexed streams have an 8-byte header per message:
@@ -137,14 +158,15 @@ function determineLogLevel(
 function emitLogMessages(
   agentId: string,
   messages: DockerLogMessage[],
-  eventBus: EventBus
+  eventBus: EventBus,
+  hierarchy: { parentAgentId?: string; treeId: string; depth: number }
 ): void {
   for (const msg of messages) {
     // Split by newlines in case multiple lines come in one message
     const lines = msg.content.split('\n').filter(line => line.trim());
     for (const line of lines) {
       const level = determineLogLevel(line, msg.streamType);
-      eventBus.emitLog(agentId, level, line);
+      eventBus.emitLog(agentId, level, line, hierarchy);
     }
   }
 }
@@ -171,6 +193,91 @@ const MAX_AUDIT_FILES = 5;
 // Agent metadata is now persisted to disk so it survives MCP server restarts
 const AGENTS_STATE_FILE = path.join(os.homedir(), ".config", "pinocchio", "agents.json");
 
+// Issue #46: Persistent spawn tree state file path
+const TREES_STATE_FILE = path.join(os.homedir(), ".config", "pinocchio", "trees.json");
+
+// Issue #90: Tree-level writable paths directory
+// Each spawn tree gets its own writable directory for isolation
+// Container path (for local filesystem operations inside MCP container)
+const WRITABLE_BASE_DIR = path.join(os.homedir(), ".config", "pinocchio", "writable");
+// Host path (for Docker bind mounts - must use HOST_HOME not os.homedir())
+const HOST_HOME = process.env.HOST_HOME || os.homedir();
+const HOST_WRITABLE_BASE_DIR = path.join(HOST_HOME, ".config", "pinocchio", "writable");
+
+// Issue #90: Helper functions for tree-level writable paths
+
+function getTreeWritableDir(treeId: string): string {
+  return path.join(WRITABLE_BASE_DIR, treeId);
+}
+
+function getHostTreeWritableDir(treeId: string): string {
+  return path.join(HOST_WRITABLE_BASE_DIR, treeId);
+}
+
+function validateTreeId(treeId: string): void {
+  // Validate treeId format: should be tree-<uuid>
+  const treeIdPattern = /^tree-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  // Also allow legacy format: tree-legacy-<agentId>
+  const legacyPattern = /^tree-legacy-[a-zA-Z0-9_-]+$/;
+
+  if (!treeIdPattern.test(treeId) && !legacyPattern.test(treeId)) {
+    throw new Error(`Invalid treeId format: ${treeId}`);
+  }
+
+  // Reject path traversal attempts
+  if (treeId.includes('..') || treeId.includes('/') || treeId.includes('\\')) {
+    throw new Error(`Invalid treeId: contains path traversal characters: ${treeId}`);
+  }
+}
+
+async function createTreeWritableDirs(treeId: string, relativePaths: string[]): Promise<void> {
+  validateTreeId(treeId);
+
+  const treeDir = getTreeWritableDir(treeId);
+  await fs.mkdir(treeDir, { recursive: true, mode: 0o755 });
+  // Explicit chmod to override umask which may have masked the mode
+  await fs.chmod(treeDir, 0o755);
+
+  for (const relPath of relativePaths) {
+    // Defense-in-depth: reject paths with parent traversal
+    if (relPath.includes('..') || path.isAbsolute(relPath)) {
+      console.error(`[pinocchio] Skipping invalid writable path: ${relPath}`);
+      continue;
+    }
+    const fullPath = path.join(treeDir, relPath);
+    await fs.mkdir(fullPath, { recursive: true, mode: 0o755 });
+    // Explicit chmod to override umask which may have masked the mode
+    await fs.chmod(fullPath, 0o755);
+  }
+}
+
+export async function cleanupTreeWritableDir(treeId: string): Promise<void> {
+  validateTreeId(treeId);
+
+  const treeDir = getTreeWritableDir(treeId);
+  try {
+    await fs.rm(treeDir, { recursive: true, force: true });
+    console.error(`[pinocchio] Cleaned up writable directory for tree: ${treeId}`);
+  } catch (error) {
+    console.error(`[pinocchio] Failed to cleanup writable dir for tree ${treeId}:`, error);
+  }
+}
+
+// Issue #47: Nested spawning configuration
+// Controls limits and behavior for agent-spawned agents
+export interface NestedSpawnConfig {
+  maxNestingDepth: number;       // Max depth of spawning (default: 2 = parent + child)
+  maxAgentsPerTree: number;      // Max total agents in a spawn tree (default: 10)
+  enableRecursiveSpawn: boolean; // Allow nested spawning at all (default: true)
+}
+
+// Issue #47: Default values for nested spawn configuration
+const DEFAULT_NESTED_SPAWN_CONFIG: NestedSpawnConfig = {
+  maxNestingDepth: 2,
+  maxAgentsPerTree: 10,
+  enableRecursiveSpawn: true,
+};
+
 // Config file structure
 interface AgentConfig {
   allowedWorkspaces: string[];
@@ -183,6 +290,8 @@ interface AgentConfig {
   };
   // WebSocket configuration
   websocket?: WebSocketConfig;
+  // Issue #47: Nested spawning configuration
+  nestedSpawn?: NestedSpawnConfig;
 }
 
 // Default config
@@ -198,6 +307,8 @@ const DEFAULT_CONFIG: AgentConfig = {
     subscriptionPolicy: 'open',
     bufferSize: 1000,
   },
+  // Issue #47: Nested spawn defaults
+  nestedSpawn: DEFAULT_NESTED_SPAWN_CONFIG,
 };
 
 // AUDIT FIX #9: Audit event structure
@@ -229,6 +340,128 @@ async function saveConfig(config: AgentConfig): Promise<void> {
   // Also ensure the directory has 0o700 permissions (owner rwx only).
   await fs.chmod(CONFIG_FILE, 0o600);
   await fs.chmod(dir, 0o700);
+}
+
+// Issue #47: Upper bounds for nested spawn configuration
+const MAX_NESTING_DEPTH_LIMIT = 10;
+const MAX_AGENTS_PER_TREE_LIMIT = 100;
+
+// Issue #47: Validate nested spawn configuration values
+// Returns error messages for any invalid values, empty array if all valid
+function validateNestedSpawnConfig(config: NestedSpawnConfig): string[] {
+  const errors: string[] = [];
+
+  if (!Number.isInteger(config.maxNestingDepth)) {
+    errors.push(`maxNestingDepth must be an integer, got ${config.maxNestingDepth}`);
+  } else if (config.maxNestingDepth < 1) {
+    errors.push(`maxNestingDepth must be >= 1, got ${config.maxNestingDepth}`);
+  } else if (config.maxNestingDepth > MAX_NESTING_DEPTH_LIMIT) {
+    errors.push(`maxNestingDepth must be <= ${MAX_NESTING_DEPTH_LIMIT}, got ${config.maxNestingDepth}`);
+  }
+
+  if (!Number.isInteger(config.maxAgentsPerTree)) {
+    errors.push(`maxAgentsPerTree must be an integer, got ${config.maxAgentsPerTree}`);
+  } else if (config.maxAgentsPerTree < 1) {
+    errors.push(`maxAgentsPerTree must be >= 1, got ${config.maxAgentsPerTree}`);
+  } else if (config.maxAgentsPerTree > MAX_AGENTS_PER_TREE_LIMIT) {
+    errors.push(`maxAgentsPerTree must be <= ${MAX_AGENTS_PER_TREE_LIMIT}, got ${config.maxAgentsPerTree}`);
+  }
+
+  if (typeof config.enableRecursiveSpawn !== 'boolean') {
+    errors.push(`enableRecursiveSpawn must be a boolean`);
+  }
+
+  return errors;
+}
+
+// Issue #47: Helper to validate a numeric env var as a positive integer within bounds
+function parseEnvVarAsPositiveInt(
+  value: string,
+  envVarName: string,
+  minValue: number,
+  maxValue: number
+): number | null {
+  const parsed = Number(value);
+
+  // Check if it's a valid number
+  if (isNaN(parsed)) {
+    console.warn(`[pinocchio] Warning: ${envVarName}="${value}" is not a valid number, ignoring`);
+    return null;
+  }
+
+  // Check if it's an integer
+  if (!Number.isInteger(parsed)) {
+    console.warn(`[pinocchio] Warning: ${envVarName}=${parsed} must be an integer, ignoring`);
+    return null;
+  }
+
+  // Check minimum bound
+  if (parsed < minValue) {
+    console.warn(`[pinocchio] Warning: ${envVarName}=${parsed} must be >= ${minValue}, ignoring`);
+    return null;
+  }
+
+  // Check maximum bound
+  if (parsed > maxValue) {
+    console.warn(`[pinocchio] Warning: ${envVarName}=${parsed} must be <= ${maxValue}, ignoring`);
+    return null;
+  }
+
+  return parsed;
+}
+
+// Issue #47: Get nested spawn config with environment variable overrides
+// Priority: environment variables > config file > defaults
+function getNestedSpawnConfig(config: AgentConfig): NestedSpawnConfig {
+  // Start with defaults, overlay config file values, then env overrides
+  const baseConfig: NestedSpawnConfig = {
+    ...DEFAULT_NESTED_SPAWN_CONFIG,
+    ...(config.nestedSpawn || {}),
+  };
+
+  // Environment variable overrides
+  const envDepth = process.env.MAX_NESTING_DEPTH;
+  const envAgents = process.env.MAX_AGENTS_PER_TREE;
+  const envRecursive = process.env.ENABLE_RECURSIVE_SPAWN;
+
+  if (envDepth !== undefined) {
+    const parsed = parseEnvVarAsPositiveInt(
+      envDepth,
+      "MAX_NESTING_DEPTH",
+      1,
+      MAX_NESTING_DEPTH_LIMIT
+    );
+    if (parsed !== null) {
+      baseConfig.maxNestingDepth = parsed;
+    }
+  }
+
+  if (envAgents !== undefined) {
+    const parsed = parseEnvVarAsPositiveInt(
+      envAgents,
+      "MAX_AGENTS_PER_TREE",
+      1,
+      MAX_AGENTS_PER_TREE_LIMIT
+    );
+    if (parsed !== null) {
+      baseConfig.maxAgentsPerTree = parsed;
+    }
+  }
+
+  if (envRecursive !== undefined) {
+    // Accept 'true', '1', 'yes' as true, anything else as false
+    baseConfig.enableRecursiveSpawn = ['true', '1', 'yes'].includes(envRecursive.toLowerCase());
+  }
+
+  // Validate the final config and log any issues
+  const validationErrors = validateNestedSpawnConfig(baseConfig);
+  if (validationErrors.length > 0) {
+    console.warn(`[pinocchio] Warning: Invalid nested spawn config: ${validationErrors.join("; ")}`);
+    // Return defaults if validation fails
+    return { ...DEFAULT_NESTED_SPAWN_CONFIG };
+  }
+
+  return baseConfig;
 }
 
 // AUDIT FIX #9: In-memory lock to prevent race condition during rotation
@@ -287,7 +520,7 @@ async function rotateAuditLogIfNeeded(): Promise<void> {
 
 // AUDIT FIX #9: Append an audit event to the log file
 // Events are stored as JSONL (one JSON object per line)
-async function auditLog(event: string, data: Record<string, unknown>, agentId?: string): Promise<void> {
+export async function auditLog(event: string, data: Record<string, unknown>, agentId?: string): Promise<void> {
   try {
     // Ensure config directory exists
     const dir = path.dirname(AUDIT_LOG_FILE);
@@ -327,6 +560,26 @@ interface PersistedAgentMetadata {
   exitCode?: number;
   endedAt?: string;   // ISO date string
   output?: string;
+
+  // Issue #45: Hierarchy tracking for nested agent spawning
+  // These fields are optional for backwards compatibility with existing state files
+  parentAgentId?: string;
+  childAgentIds?: string[];
+  nestingDepth?: number;
+  treeId?: string;
+
+  // Issue #48: Session token for nested agent authentication
+  sessionToken?: string;
+}
+
+// Issue #46: Serializable spawn tree for persistence
+interface PersistedSpawnTree {
+  treeId: string;
+  rootAgentId: string;
+  totalAgents: number;
+  maxDepthReached: number;
+  createdAt: string;  // ISO date string
+  status: "active" | "terminated";
 }
 
 // RELIABILITY FIX #4: Load agent state from disk on startup
@@ -369,6 +622,8 @@ async function loadAgentState(): Promise<void> {
       }
 
       // Restore metadata with Date objects
+      // Issue #45: Handle backwards compatibility for hierarchy fields
+      // Old state files won't have these fields, so provide sensible defaults
       const metadata: AgentMetadata = {
         id: item.id,
         task: item.task,
@@ -379,6 +634,13 @@ async function loadAgentState(): Promise<void> {
         exitCode: item.exitCode,
         endedAt,
         output: item.output,
+        // Issue #45: Default hierarchy values for backwards compatibility
+        parentAgentId: item.parentAgentId,
+        childAgentIds: item.childAgentIds ?? [],
+        nestingDepth: item.nestingDepth ?? 0,
+        treeId: item.treeId ?? `tree-legacy-${item.id}`,
+        // Issue #48: Session token (will be validated/re-signed after agent state loads)
+        sessionToken: item.sessionToken,
       };
 
       // If agent was marked as running but server restarted, mark as failed
@@ -422,6 +684,13 @@ async function saveAgentState(): Promise<void> {
         exitCode: metadata.exitCode,
         endedAt: metadata.endedAt?.toISOString(),
         output: metadata.output,
+        // Issue #45: Persist hierarchy tracking fields
+        parentAgentId: metadata.parentAgentId,
+        childAgentIds: metadata.childAgentIds,
+        nestingDepth: metadata.nestingDepth,
+        treeId: metadata.treeId,
+        // Issue #48: Persist session token
+        sessionToken: metadata.sessionToken,
       });
     }
 
@@ -436,11 +705,97 @@ async function saveAgentState(): Promise<void> {
   }
 }
 
+// Issue #46: Load spawn tree state from disk on startup
+async function loadTreeState(): Promise<void> {
+  try {
+    const data = await fs.readFile(TREES_STATE_FILE, "utf-8");
+    let persisted: PersistedSpawnTree[];
+
+    try {
+      persisted = JSON.parse(data);
+    } catch (parseError) {
+      // JSON parse failed - back up corrupted file for debugging
+      const backupFile = `${TREES_STATE_FILE}.corrupted.${Date.now()}`;
+      console.error(`[pinocchio] Trees state file corrupted, backing up to: ${backupFile}`);
+      try {
+        await fs.copyFile(TREES_STATE_FILE, backupFile);
+        await fs.chmod(backupFile, 0o600);
+      } catch (backupError) {
+        console.error(`[pinocchio] Warning: Could not create backup: ${backupError}`);
+      }
+      console.error(`[pinocchio] Starting with fresh tree state due to parse error: ${parseError}`);
+      return;
+    }
+
+    const now = new Date();
+    const maxAge = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
+
+    for (const item of persisted) {
+      const createdAt = new Date(item.createdAt);
+
+      // Clean up old trees (older than 24 hours)
+      if (now.getTime() - createdAt.getTime() > maxAge) {
+        console.error(`[pinocchio] Cleaning up old tree metadata: ${item.treeId}`);
+        continue;
+      }
+
+      // Restore tree with Date objects
+      const tree: SpawnTree = {
+        treeId: item.treeId,
+        rootAgentId: item.rootAgentId,
+        totalAgents: item.totalAgents,
+        maxDepthReached: item.maxDepthReached,
+        createdAt,
+        status: item.status,
+      };
+
+      spawnTrees.set(item.treeId, tree);
+    }
+
+    console.error(`[pinocchio] Loaded ${spawnTrees.size} spawn tree(s) from state file`);
+  } catch (error) {
+    // File doesn't exist or is invalid - start fresh
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.error(`[pinocchio] Warning: Could not load tree state: ${error}`);
+    }
+  }
+}
+
+// Issue #46: Save spawn tree state to disk
+// Called when tree state changes (create, update, terminate)
+async function saveTreeState(): Promise<void> {
+  try {
+    const dir = path.dirname(TREES_STATE_FILE);
+    await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+
+    // Convert Map to array with dates as ISO strings
+    const persisted: PersistedSpawnTree[] = [];
+    for (const [, tree] of spawnTrees) {
+      persisted.push({
+        treeId: tree.treeId,
+        rootAgentId: tree.rootAgentId,
+        totalAgents: tree.totalAgents,
+        maxDepthReached: tree.maxDepthReached,
+        createdAt: tree.createdAt.toISOString(),
+        status: tree.status,
+      });
+    }
+
+    // Use atomic write pattern (temp file + rename) to prevent corruption
+    const tempFile = `${TREES_STATE_FILE}.tmp.${process.pid}`;
+    await fs.writeFile(tempFile, JSON.stringify(persisted, null, 2), { mode: 0o600 });
+    await fs.chmod(tempFile, 0o600);
+    await fs.rename(tempFile, TREES_STATE_FILE);
+  } catch (error) {
+    console.error(`[pinocchio] Warning: Could not save tree state: ${error}`);
+  }
+}
+
 // Docker client
 const docker = new Docker();
 
 // Agent metadata for tracking
-interface AgentMetadata {
+export interface AgentMetadata {
   id: string;
   task: string;
   workspacePath: string;
@@ -452,14 +807,316 @@ interface AgentMetadata {
   output?: string;
   // SECURITY FIX #8: Track token file path for cleanup
   tokenFilePath?: string;
+
+  // Issue #45: Hierarchy tracking for nested agent spawning
+  parentAgentId?: string;        // ID of parent agent (undefined for root)
+  childAgentIds: string[];       // IDs of spawned children
+  nestingDepth: number;          // 0 for root, increments per level
+  treeId: string;                // Unique ID for the entire spawn tree
+
+  // Issue #48: Session token for nested agent authentication
+  sessionToken?: string;         // The token string (stored separately in sessionTokens map)
+}
+
+// Issue #64: Child agent summary for get_agent_status response
+export interface ChildAgentSummary {
+  agentId: string;
+  status: string;
+  task: string;  // truncated to 80 chars
 }
 
 // Track running agents and their metadata
 const runningAgents = new Map<string, Docker.Container>();
 const agentMetadata = new Map<string, AgentMetadata>();
 
+// Issue #46: SpawnTree tracks an entire hierarchy of spawned agents as a single unit
+export interface SpawnTree {
+  treeId: string;                        // Unique tree identifier (matches AgentMetadata.treeId)
+  rootAgentId: string;                   // ID of the root agent that started this tree
+  totalAgents: number;                   // Count of all agents in this tree (root + children)
+  maxDepthReached: number;               // Highest nesting depth used in this tree
+  createdAt: Date;                       // When the tree was created
+  status: "active" | "terminated";       // Tree lifecycle status
+}
+
+// Issue #46: Track all spawn trees
+const spawnTrees = new Map<string, SpawnTree>();
+
+// Issue #46: Create a new spawn tree when a root agent is spawned
+function createSpawnTree(rootAgentId: string, treeId: string): SpawnTree {
+  const tree: SpawnTree = {
+    treeId,
+    rootAgentId,
+    totalAgents: 1,        // Root agent counts as first agent
+    maxDepthReached: 0,    // Root is at depth 0
+    createdAt: new Date(),
+    status: "active",
+  };
+  spawnTrees.set(treeId, tree);
+  console.error(`[pinocchio] Created spawn tree: ${treeId} for root agent: ${rootAgentId}`);
+  return tree;
+}
+
+// Issue #46: Get a spawn tree by ID
+export function getSpawnTree(treeId: string): SpawnTree | undefined {
+  return spawnTrees.get(treeId);
+}
+
+// Issue #51: Get agent metadata by ID (for session module)
+export function getAgentMetadata(agentId: string): AgentMetadata | undefined {
+  return agentMetadata.get(agentId);
+}
+
+// Issue #61: Get all agent metadata (for orphan detection)
+export function getAllAgentMetadata(): Map<string, AgentMetadata> {
+  return agentMetadata;
+}
+
+// Issue #46: Update tree agent count (delta can be positive or negative)
+async function updateTreeAgentCount(treeId: string, delta: number): Promise<void> {
+  const tree = spawnTrees.get(treeId);
+  if (tree) {
+    tree.totalAgents = Math.max(0, tree.totalAgents + delta);
+    console.error(`[pinocchio] Tree ${treeId} agent count updated to: ${tree.totalAgents}`);
+    await saveTreeState(); // Auto-persist changes
+  }
+}
+
+// Issue #46: Update the maximum depth reached in a tree
+async function updateTreeMaxDepth(treeId: string, depth: number): Promise<void> {
+  const tree = spawnTrees.get(treeId);
+  if (tree && depth > tree.maxDepthReached) {
+    tree.maxDepthReached = depth;
+    console.error(`[pinocchio] Tree ${treeId} max depth updated to: ${tree.maxDepthReached}`);
+    await saveTreeState(); // Auto-persist changes
+  }
+}
+
+// Issue #46: Mark a tree as terminated (all agents finished)
+function terminateSpawnTree(treeId: string): void {
+  const tree = spawnTrees.get(treeId);
+  if (tree && tree.status === "active") {
+    tree.status = "terminated";
+    // Issue #48: Invalidate all session tokens for this tree
+    // Tokens are no longer valid once a tree is terminated
+    invalidateTokensForTree(treeId);
+    // PR #86: Clean up tree buffer to prevent memory leak
+    eventBus.clearTreeBuffer(treeId);
+    console.error(`[pinocchio] Spawn tree terminated: ${treeId}`);
+  }
+}
+
+// Issue #46: Get all agents belonging to a specific tree
+function getAgentsByTree(treeId: string): AgentMetadata[] {
+  const agents: AgentMetadata[] = [];
+  for (const [, metadata] of agentMetadata) {
+    if (metadata.treeId === treeId) {
+      agents.push(metadata);
+    }
+  }
+  return agents;
+}
+
+// Issue #46: Check if a tree should be terminated (all agents completed/failed)
+function checkAndTerminateTree(treeId: string): void {
+  const tree = spawnTrees.get(treeId);
+  if (!tree || tree.status === "terminated") {
+    return;
+  }
+
+  const agents = getAgentsByTree(treeId);
+  const allDone = agents.every(a => a.status === "completed" || a.status === "failed");
+
+  // Note: [].every() returns true for empty arrays, so orphaned trees
+  // (trees with no agents due to cleanup timing) will also be terminated
+  if (allDone) {
+    terminateSpawnTree(treeId);
+  }
+}
+
+// Issue #91: Automatic cascade termination when parent finishes
+// When a parent agent completes or fails, immediately terminate its children
+// rather than waiting for orphan detection (which runs every 60 seconds)
+async function cascadeTerminateChildren(agentId: string): Promise<void> {
+  const metadata = agentMetadata.get(agentId);
+  if (!metadata || metadata.childAgentIds.length === 0) {
+    return; // No children to terminate
+  }
+
+  console.error(`[pinocchio] Issue #91: Agent ${agentId} has ${metadata.childAgentIds.length} children, triggering automatic cascade termination`);
+
+  // Terminate each child (which will recursively terminate grandchildren)
+  for (const childId of metadata.childAgentIds) {
+    const childMetadata = agentMetadata.get(childId);
+    if (!childMetadata || childMetadata.status !== "running") {
+      continue; // Skip already terminated children
+    }
+
+    try {
+      const result = await terminateWithChildren(
+        childId,
+        "SIGTERM",
+        updateAgentMetadataForCascade,
+        runningAgents,
+        agentId, // This agent initiated the cascade
+        "cascade"
+      );
+      console.error(`[pinocchio] Issue #91: Cascade terminated ${result.terminated.length} agents (child tree of ${childId})`);
+    } catch (error) {
+      console.error(`[pinocchio] Issue #91: Failed to cascade terminate child ${childId}: ${error}`);
+    }
+  }
+}
+
 // WebSocket server instance (initialized in main if enabled)
 let wsServer: PinocchioWebSocket | null = null;
+
+// Issue #50: Wrapper for validateSessionToken for WebSocket server
+// Converts internal TokenValidationResult to the WebSocket module's format
+function validateSessionTokenForHttp(tokenString: string): WsTokenValidationResult {
+  const result = validateSessionToken(tokenString);
+  if (!result.valid || !result.token) {
+    return { valid: false, error: result.error };
+  }
+  // Map internal token to the websocket module's format (without signature)
+  return {
+    valid: true,
+    token: {
+      agentId: result.token.agentId,
+      treeId: result.token.treeId,
+      parentAgentId: result.token.parentAgentId,
+      depth: result.token.depth,
+      maxDepth: result.token.maxDepth,
+      expiresAt: result.token.expiresAt,
+      permissions: result.token.permissions,
+    },
+  };
+}
+
+// Issue #50: Spawn handler wrapper for WebSocket server
+// Calls spawnDockerAgent and returns structured result for HTTP response
+async function handleSpawnFromHttp(args: SpawnHandlerArgs): Promise<SpawnHandlerResult> {
+  const startTime = Date.now();
+
+  try {
+    // Call spawnDockerAgent with run_in_background: false (blocking)
+    const result = await spawnDockerAgent({
+      task: args.task,
+      workspace_path: args.workspace_path,
+      writable_paths: args.writable_paths,
+      timeout_ms: args.timeout_ms,
+      parent_agent_id: args.parent_agent_id,
+      run_in_background: false, // Always blocking for child spawns
+    });
+
+    // Parse the MCP response format
+    if (result.isError) {
+      // Extract error message from the structured response
+      const errorText = result.content?.[0]?.text || 'Unknown error';
+      // Try to extract a clean error message from the markdown
+      const errorMatch = errorText.match(/\*\*Error:\*\*\s*(.+)/);
+      return {
+        success: false,
+        error: errorMatch ? errorMatch[1] : errorText.slice(0, 500),
+      };
+    }
+
+    // Extract data from successful response
+    const responseText = result.content?.[0]?.text || '';
+
+    // Parse exit code from the table format
+    const exitCodeMatch = responseText.match(/\*\*Exit Code\*\*\s*\|\s*(\d+)/);
+    const exitCode = exitCodeMatch ? parseInt(exitCodeMatch[1], 10) : 0;
+
+    // Parse duration from the table format
+    const durationMatch = responseText.match(/\*\*Duration\*\*\s*\|\s*([^\n|]+)/);
+    let durationMs = Date.now() - startTime;
+    if (durationMatch) {
+      // Parse duration like "45.2s" or "1m 23s"
+      const durationStr = durationMatch[1].trim();
+      const seconds = parseFloat(durationStr.replace(/[ms]/g, '')) || 0;
+      if (durationStr.includes('m')) {
+        const parts = durationStr.match(/(\d+)m\s*(\d+\.?\d*)s/);
+        if (parts) {
+          durationMs = (parseInt(parts[1], 10) * 60 + parseFloat(parts[2])) * 1000;
+        }
+      } else {
+        durationMs = seconds * 1000;
+      }
+    }
+
+    // Parse agent ID from the header
+    const agentIdMatch = responseText.match(/Agent\s+(claude-agent-\w+|[\w-]+)\s+(?:Completed|Failed)/);
+    const agentId = agentIdMatch ? agentIdMatch[1] : 'unknown';
+
+    // Parse files modified section
+    const filesModified: string[] = [];
+    const filesSection = responseText.match(/\*\*Files Modified:\*\*\n((?:- [^\n]+\n?)+)/);
+    if (filesSection) {
+      const fileLines = filesSection[1].split('\n');
+      for (const line of fileLines) {
+        const fileMatch = line.match(/^- (.+)$/);
+        if (fileMatch) {
+          filesModified.push(fileMatch[1].trim());
+        }
+      }
+    }
+
+    // Extract output from the details section
+    let output = '';
+    const outputMatch = responseText.match(/<details><summary>Full Output<\/summary>\n\n```\n([\s\S]*?)```\n<\/details>/);
+    if (outputMatch) {
+      output = outputMatch[1];
+    }
+
+    // Determine status based on exit code
+    const status = exitCode === 0 ? 'completed' : 'failed';
+
+    return {
+      success: true,
+      agent_id: agentId,
+      status,
+      exit_code: exitCode,
+      output,
+      duration_ms: durationMs,
+      files_modified: filesModified.length > 0 ? filesModified : undefined,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[pinocchio] handleSpawnFromHttp error: ${message}`);
+    return {
+      success: false,
+      error: message,
+    };
+  }
+}
+
+// Issue #53: Tree info getter for WebSocket quota enforcement
+function getTreeInfoForHttp(treeId: string): { treeId: string; totalAgents: number; status: 'active' | 'terminated' } | undefined {
+  const tree = getSpawnTree(treeId);
+  if (!tree) return undefined;
+  return {
+    treeId: tree.treeId,
+    totalAgents: tree.totalAgents,
+    status: tree.status,
+  };
+}
+
+// Issue #53: Running agent counter for WebSocket quota enforcement
+function getRunningAgentCountForHttp(): number {
+  return runningAgents.size;
+}
+
+// Issue #53: Quota config getter for WebSocket quota enforcement
+function getQuotaConfigForHttp(): { maxAgentsPerTree: number; maxConcurrentAgents: number } {
+  // Load fresh config to get nested spawn settings
+  // Note: We use synchronous defaults here since this is called frequently
+  // and loadConfig() is async. The defaults match RATE_LIMIT and DEFAULT_NESTED_SPAWN_CONFIG
+  return {
+    maxAgentsPerTree: Number(process.env.MAX_AGENTS_PER_TREE) || DEFAULT_NESTED_SPAWN_CONFIG.maxAgentsPerTree,
+    maxConcurrentAgents: Number(process.env.MAX_CONCURRENT_AGENTS) || 5,
+  };
+}
 
 // SECURITY FIX #5: Rate limiting configuration to prevent DoS attacks.
 // Limits how many agents can run concurrently and how fast they can be spawned.
@@ -590,7 +1247,7 @@ async function createSecureTokenFile(agentId: string, token: string): Promise<st
 // SECURITY FIX #8.1: Added cleanup flag to prevent double cleanup race condition.
 // Multiple code paths can trigger cleanup (foreground completion, background monitor, error handlers).
 // The cleanedTokenFiles Set ensures each file is only deleted once.
-async function cleanupTokenFile(tokenFilePath: string): Promise<void> {
+export async function cleanupTokenFile(tokenFilePath: string): Promise<void> {
   // SECURITY FIX #8.1: Check if already cleaned up to prevent race condition
   if (cleanedTokenFiles.has(tokenFilePath)) {
     return;
@@ -708,6 +1365,50 @@ async function isWorkspaceAllowed(workspacePath: string): Promise<{ allowed: boo
   return { allowed: true };
 }
 
+/**
+ * Validates that a sub-agent's workspace request is within allowed boundaries.
+ * Sub-agents can only access:
+ * 1. The same workspace as their parent (inherits parent's access)
+ * 2. Any path under the tree's /writable/ directory
+ *
+ * @param parentMetadata - The parent agent's metadata
+ * @param requestedWorkspace - The workspace path requested by the sub-agent
+ * @param treeId - The spawn tree ID for writable directory access
+ * @returns Object with allowed boolean and optional reason string
+ */
+function validateSubagentWorkspace(
+  parentMetadata: AgentMetadata,
+  requestedWorkspace: string,
+  treeId: string
+): { allowed: boolean; reason?: string } {
+  // Normalize paths for comparison
+  const normalizedRequested = path.resolve(requestedWorkspace);
+  const normalizedParentWorkspace = path.resolve(parentMetadata.workspacePath);
+  const treeWritableDir = getHostTreeWritableDir(treeId);
+  const normalizedTreeWritable = path.resolve(treeWritableDir);
+
+  // Check if requested workspace is the same as parent's workspace
+  if (normalizedRequested === normalizedParentWorkspace) {
+    return { allowed: true };
+  }
+
+  // Check if requested workspace is under parent's workspace
+  if (normalizedRequested.startsWith(normalizedParentWorkspace + "/")) {
+    return { allowed: true };
+  }
+
+  // Check if requested workspace is under the tree's writable directory
+  if (normalizedRequested === normalizedTreeWritable ||
+      normalizedRequested.startsWith(normalizedTreeWritable + "/")) {
+    return { allowed: true };
+  }
+
+  return {
+    allowed: false,
+    reason: `Sub-agent workspace must be within parent's workspace ('${parentMetadata.workspacePath}') or the tree's writable directory ('${treeWritableDir}'). Requested: '${requestedWorkspace}'`
+  };
+}
+
 // Tool definitions
 const TOOLS = [
   {
@@ -717,18 +1418,18 @@ const TOOLS = [
 The agent runs with full autonomy (YOLO mode) inside a secured container with:
 - Read-only access to your Claude Max credentials
 - Configurable network access (disabled by default for security)
-- **Read-only workspace by default** - agent can only read files unless writable paths are specified
+- **Read-only workspace by default** - use workspace_writable: true for direct file modifications
 - Optional Docker access via secure proxy for running tests/builds
 
 **Security Model:**
-- Workspace is mounted READ-ONLY by default
-- Use 'writable_paths' or 'writable_patterns' to allow writing to specific files/folders
-- This ensures agents can only modify what you explicitly allow
+- Workspace (/workspace) is mounted READ-ONLY by default
+- Set 'workspace_writable: true' to allow direct file modifications
+- Use 'writable_paths' for tree-isolated scratch space at /writable/
 
 **Examples:**
-- Review code: no writable paths needed (read-only)
-- Fix a bug: writable_paths: ['src/buggy-file.ts']
-- Run tests: writable_patterns: ['**/*.test.ts', 'coverage/']`,
+- Review code: no options needed (read-only workspace)
+- Fix a bug: workspace_writable: true (direct workspace writes)
+- Isolated work: writable_paths: ['output/'] (scratch space at /writable/output/)`,
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -769,6 +1470,10 @@ The agent runs with full autonomy (YOLO mode) inside a secured container with:
           items: { type: "string" },
           description: "Glob patterns (relative to workspace) for writable files. Example: ['src/**/*.ts', '*.md']",
         },
+        workspace_writable: {
+          type: "boolean",
+          description: "Mount workspace as read-write, allowing agent to directly modify project files. Default: false (read-only workspace).",
+        },
         run_in_background: {
           type: "boolean",
           description: "Run agent in background. Returns immediately with agent ID. Use get_agent_status to check progress. Default: false",
@@ -784,6 +1489,12 @@ The agent runs with full autonomy (YOLO mode) inside a secured container with:
 - manage: Write + milestones, projects, labels (for PM/Scrum)
 - admin: Full access (repo settings, workflows, secrets)`,
         },
+        // Issue #49: Internal parameter for nested spawning
+        // This is used by the HTTP endpoint when agents spawn children, not for direct Claude Code use
+        parent_agent_id: {
+          type: "string",
+          description: "Internal: Parent agent ID for nested spawning. Used by HTTP endpoint when agents spawn children.",
+        },
       },
       required: ["task", "workspace_path"],
     },
@@ -798,13 +1509,14 @@ The agent runs with full autonomy (YOLO mode) inside a secured container with:
   },
   {
     name: "get_agent_status",
-    description: `Get the status and output of a running or completed agent.
+    description: `Get the status and output of a running or completed agent. Includes hierarchy info (treeId, depth, childAgentIds). Set include_children: true for detailed child agent summaries.
 
 Returns:
 - Current status (running/completed/failed)
 - Task progress and logs
 - Files modified (if completed)
 - Duration and resource usage
+- Agent hierarchy info (parent, tree, depth, children)
 
 Use this to check on background agents or get detailed results.`,
     inputSchema: {
@@ -817,6 +1529,10 @@ Use this to check on background agents or get detailed results.`,
         tail_lines: {
           type: "number",
           description: "Number of log lines to return (default: 100, use 0 for all)",
+        },
+        include_children: {
+          type: "boolean",
+          description: "Include detailed status summaries of child agents (default: false)",
         },
       },
       required: ["agent_id"],
@@ -838,12 +1554,13 @@ Use this to check on background agents or get detailed results.`,
   },
   {
     name: "manage_config",
-    description: `Manage Pinocchio configuration (workspaces, GitHub, settings, audit).
+    description: `Manage Pinocchio configuration (workspaces, GitHub, settings, nested spawning, audit).
 
 **Sections:**
 - workspaces: Manage allowed workspace paths
 - github: Configure GitHub access and credentials
 - settings: View/modify general settings
+- nestedspawn: Configure nested agent spawning limits
 - audit: View audit logs
 
 **Workspace Actions:**
@@ -861,6 +1578,10 @@ Use this to check on background agents or get detailed results.`,
 
 **Settings Actions:**
 - settings.show: Display all settings
+
+**Nested Spawn Actions:**
+- nestedspawn.show: Display nested spawning configuration
+- nestedspawn.set: Update nested spawn settings (use max_depth, max_agents, enable_recursive params)
 
 **Audit Actions:**
 - audit.recent: View the last 50 audit log entries`,
@@ -887,6 +1608,19 @@ Use this to check on background agents or get detailed results.`,
           type: "string",
           enum: ["none", "read", "comment", "write", "manage", "admin"],
           description: "Default GitHub access level (for github.set_default)",
+        },
+        // Issue #47: Parameters for nested spawn configuration
+        max_depth: {
+          type: "number",
+          description: "Max nesting depth for spawned agents (for nestedspawn.set)",
+        },
+        max_agents: {
+          type: "number",
+          description: "Max agents per spawn tree (for nestedspawn.set)",
+        },
+        enable_recursive: {
+          type: "boolean",
+          description: "Enable recursive spawning (for nestedspawn.set)",
         },
       },
       required: ["action"],
@@ -929,13 +1663,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         writable_patterns?: string[];
         run_in_background?: boolean;
         github_access?: "none" | "read" | "comment" | "write" | "manage" | "admin";
+        // Issue #49: Internal parameter for nested spawning
+        parent_agent_id?: string;
       });
 
     case "list_docker_agents":
       return await listDockerAgents();
 
     case "get_agent_status":
-      return await getAgentStatus(args as { agent_id: string; tail_lines?: number });
+      return await getAgentStatus(args as { agent_id: string; tail_lines?: number; include_children?: boolean });
 
     case "stop_docker_agent":
       return await stopDockerAgent(args as { agent_id: string });
@@ -947,6 +1683,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         reason?: string;
         token?: string;
         default_access?: "none" | "read" | "comment" | "write" | "manage" | "admin";
+        // Issue #47: Nested spawn config params
+        max_depth?: number;
+        max_agents?: number;
+        enable_recursive?: boolean;
       });
 
     default:
@@ -1133,8 +1873,11 @@ async function spawnDockerAgent(args: {
   allow_network?: boolean;
   writable_paths?: string[];
   writable_patterns?: string[];
+  workspace_writable?: boolean;
   run_in_background?: boolean;
   github_access?: "none" | "read" | "comment" | "write" | "manage" | "admin";
+  // Issue #49: Internal parameter for nested spawning
+  parent_agent_id?: string;
 }) {
   // Generate agent ID early so we can use it for reservation
   const agentId = args.container_name || `claude-agent-${uuidv4().slice(0, 8)}`;
@@ -1230,22 +1973,152 @@ async function spawnDockerAgent(args: {
   const config = await loadConfig();
   const github_access = args.github_access || config.github?.defaultAccess || "none";
 
+  // Issue #49: Load nested spawn configuration early for hierarchy validation
+  const nestedSpawnConfig = getNestedSpawnConfig(config);
+
+  // Issue #49: Handle nested spawning - validate parent agent and spawn constraints
+  let parentMetadata: AgentMetadata | undefined;
+  let parentTreeId: string | undefined;
+  let nestingDepth = 0;
+
+  if (args.parent_agent_id) {
+    // Validate that recursive spawning is enabled
+    if (!nestedSpawnConfig.enableRecursiveSpawn) {
+      pendingReservations.delete(agentId);
+      return {
+        content: [{
+          type: "text" as const,
+          text: `## Nested Spawning Disabled\n\n**Error:** Recursive agent spawning is disabled in configuration.`,
+        }],
+        isError: true,
+      };
+    }
+
+    // Validate parent agent exists
+    parentMetadata = agentMetadata.get(args.parent_agent_id);
+    if (!parentMetadata) {
+      pendingReservations.delete(agentId);
+      await auditLog("spawn.parent_not_found", {
+        requested_agent_id: agentId,
+        parent_agent_id: args.parent_agent_id,
+      });
+      return {
+        content: [{
+          type: "text" as const,
+          text: `## Parent Agent Not Found\n\n**Error:** Parent agent '${args.parent_agent_id}' does not exist.`,
+        }],
+        isError: true,
+      };
+    }
+
+    // Validate parent agent is still running
+    if (parentMetadata.status !== 'running') {
+      pendingReservations.delete(agentId);
+      await auditLog("spawn.parent_not_running", {
+        requested_agent_id: agentId,
+        parent_agent_id: args.parent_agent_id,
+        parent_status: parentMetadata.status,
+      });
+      return {
+        content: [{
+          type: "text" as const,
+          text: `## Parent Agent Not Running\n\n**Error:** Parent agent '${args.parent_agent_id}' is no longer running (status: ${parentMetadata.status}).`,
+        }],
+        isError: true,
+      };
+    }
+
+    // Calculate nesting depth for child
+    nestingDepth = parentMetadata.nestingDepth + 1;
+    parentTreeId = parentMetadata.treeId;
+
+    // Validate depth limit
+    if (nestingDepth > nestedSpawnConfig.maxNestingDepth) {
+      pendingReservations.delete(agentId);
+      await auditLog("spawn.depth_limit_exceeded", {
+        requested_agent_id: agentId,
+        parent_agent_id: args.parent_agent_id,
+        requested_depth: nestingDepth,
+        max_depth: nestedSpawnConfig.maxNestingDepth,
+      });
+      return {
+        content: [{
+          type: "text" as const,
+          text: `## Maximum Nesting Depth Exceeded\n\n**Error:** Cannot spawn child agent at depth ${nestingDepth}. Maximum depth is ${nestedSpawnConfig.maxNestingDepth}.`,
+        }],
+        isError: true,
+      };
+    }
+
+    // Validate tree agent limit
+    const tree = getSpawnTree(parentTreeId);
+    if (tree && tree.totalAgents >= nestedSpawnConfig.maxAgentsPerTree) {
+      pendingReservations.delete(agentId);
+      await auditLog("spawn.tree_limit_exceeded", {
+        requested_agent_id: agentId,
+        parent_agent_id: args.parent_agent_id,
+        tree_id: parentTreeId,
+        current_agents: tree.totalAgents,
+        max_agents: nestedSpawnConfig.maxAgentsPerTree,
+      });
+      return {
+        content: [{
+          type: "text" as const,
+          text: `## Maximum Agents Per Tree Exceeded\n\n**Error:** Cannot spawn child agent. The spawn tree already has ${tree.totalAgents} agents, maximum is ${nestedSpawnConfig.maxAgentsPerTree}.`,
+        }],
+        isError: true,
+      };
+    }
+
+    console.error(`[pinocchio] Nested spawn: parent=${args.parent_agent_id}, tree=${parentTreeId}, depth=${nestingDepth}`);
+
+    // Validate sub-agent workspace restriction
+    // Sub-agents can only access: parent's workspace OR tree's writable directory
+    const subagentWorkspaceCheck = validateSubagentWorkspace(parentMetadata, workspace_path, parentTreeId);
+    if (!subagentWorkspaceCheck.allowed) {
+      pendingReservations.delete(agentId);
+      await auditLog("spawn.subagent_workspace_denied", {
+        requested_agent_id: agentId,
+        parent_agent_id: args.parent_agent_id,
+        parent_workspace: parentMetadata.workspacePath,
+        requested_workspace: workspace_path,
+        tree_id: parentTreeId,
+      });
+      return {
+        content: [{
+          type: "text" as const,
+          text: `## Sub-agent Workspace Access Denied\n\n**Error:** ${subagentWorkspaceCheck.reason}`,
+        }],
+        isError: true,
+      };
+    }
+  }
+
   // Apply timeout limits: default 1h, max 24h (configurable via env)
   const requestedTimeout = args.timeout_ms ?? CONFIG.defaultTimeout;
   const timeout_ms = Math.min(Math.max(requestedTimeout, 1000), CONFIG.absoluteMaxTimeout);
 
   // Validate workspace path against allowlist
-  const workspaceCheck = await isWorkspaceAllowed(workspace_path);
-  if (!workspaceCheck.allowed) {
-    // SECURITY FIX #5.1: Release reservation on early return
-    pendingReservations.delete(agentId);
-    return {
-      content: [{
-        type: "text" as const,
-        text: `## Workspace path not allowed\n\n**Error:** ${workspaceCheck.reason}`,
-      }],
-      isError: true,
-    };
+  // Skip allowlist check for sub-agents using tree writable directory (already validated above)
+  const isSubagentUsingTreeWritable = args.parent_agent_id && parentTreeId && (() => {
+    const normalizedWorkspace = path.resolve(workspace_path);
+    const treeWritableDir = path.resolve(getHostTreeWritableDir(parentTreeId));
+    return normalizedWorkspace === treeWritableDir || normalizedWorkspace.startsWith(treeWritableDir + "/");
+  })();
+
+  if (!isSubagentUsingTreeWritable) {
+    const workspaceCheck = await isWorkspaceAllowed(workspace_path);
+    if (!workspaceCheck.allowed) {
+      // SECURITY FIX #5.1: Release reservation on early return
+      pendingReservations.delete(agentId);
+      return {
+        content: [{
+          type: "text" as const,
+          text: `## Workspace path not allowed\n\n**Error:** ${workspaceCheck.reason}`,
+        }],
+        isError: true,
+      };
+    }
   }
 
   // Sanitize task string
@@ -1268,6 +2141,10 @@ async function spawnDockerAgent(args: {
   // PR #32 FIX: Variables declared at function scope for proper cleanup in catch block
   let foregroundLogStream: NodeJS.ReadableStream | null = null;
   let foregroundDemuxer: DockerStreamDemultiplexer | null = null;
+
+  // Issue #90 FIX: Variables declared at function scope for proper cleanup in catch block
+  let treeId: string | null = null;
+  let treeWritableDirsCreated = false;
 
   try {
     // Verify workspace path exists
@@ -1309,6 +2186,18 @@ async function spawnDockerAgent(args: {
     const hasWritablePaths = resolvedWritablePaths.length > 0;
     const accessMode = hasWritablePaths ? "read-only + specific writes" : "read-only";
 
+    // Issue #90: Inject workspace and writable path guidance into task
+    let taskWithGuidance = sanitizedTask;
+    // Always mention /writable/ is available as scratch space
+    taskWithGuidance += `\n\n[SCRATCH SPACE: /writable/ is available for temporary files, builds, and downloads.]`;
+    if (args.workspace_writable) {
+      taskWithGuidance += `\n[WORKSPACE: Read-write mode. You can directly modify files in /workspace.]`;
+    }
+    if (hasWritablePaths) {
+      const relativePaths = resolvedWritablePaths.map(p => path.relative(workspace_path, p));
+      taskWithGuidance += `\n[WRITABLE PATHS: Pre-created at ${relativePaths.map(p => '/writable/' + p).join(', ')}]`;
+    }
+
     console.error(`[pinocchio] Starting agent: ${agentId}`);
     console.error(`[pinocchio] Workspace: ${workspace_path}`);
     console.error(`[pinocchio] Access mode: ${accessMode}`);
@@ -1333,7 +2222,7 @@ async function spawnDockerAgent(args: {
 
     // Build environment variables
     const envVars = [
-      `AGENT_TASK=${sanitizedTask}`,
+      `AGENT_TASK=${taskWithGuidance}`,
       `AGENT_WORKDIR=/workspace`,
       `HOME=/home/agent`,
       `WORKSPACE_MODE=${hasWritablePaths ? "restricted" : "readonly"}`,
@@ -1368,10 +2257,44 @@ async function spawnDockerAgent(args: {
       }
     }
 
+    // Issue #46: Generate treeId for this root agent's spawn tree
+    // Issue #49: For child agents, inherit the parent's treeId instead of generating a new one
+    // NOTE: Moved before container creation so token can be injected into env vars
+    treeId = parentTreeId ?? `tree-${crypto.randomUUID()}`;
+
+    // Issue #48: Generate session token for this agent
+    // Root agents get tokens that allow them to spawn children (if config permits)
+    // Issue #49: Child agents also get tokens, with inherited hierarchy info
+    // NOTE: Moved before container creation so token can be injected into env vars (Issue #57)
+    const agentSessionToken = generateToken(
+      agentId,
+      treeId,
+      args.parent_agent_id,  // parentAgentId (undefined for root agents)
+      nestingDepth,          // 0 for root, parent.depth + 1 for children
+      nestedSpawnConfig,
+      timeout_ms,
+      github_access !== "none"  // Inherit GitHub token permission if GitHub access is granted
+    );
+    storeSessionToken(agentSessionToken);
+
+    // Issue #57: Inject spawn proxy environment variables if agent can spawn children
+    if (nestedSpawnConfig.enableRecursiveSpawn &&
+        nestingDepth < nestedSpawnConfig.maxNestingDepth) {
+      // Inject spawn proxy configuration
+      // Use mcp-server hostname if on docker-proxy network, otherwise use host.docker.internal
+      const apiUrl = allow_docker ? "http://mcp-server:3001" : "http://host.docker.internal:3001";
+      envVars.push(`PINOCCHIO_API_URL=${apiUrl}`);
+      envVars.push(`PINOCCHIO_SESSION_TOKEN=${agentSessionToken.token}`);
+      // Pass host workspace path so child agents can be spawned with correct path
+      envVars.push(`PINOCCHIO_HOST_WORKSPACE=${workspace_path}`);
+      console.error(`[pinocchio] Injected spawn proxy env vars for agent: ${agentId}`);
+    }
+
     // Build bind mounts
-    // Workspace is mounted read-only by default for security
+    // Workspace is mounted read-only by default, read-write when workspace_writable is true
+    const workspaceMode = args.workspace_writable ? 'rw' : 'ro';
     const binds: string[] = [
-      `${workspace_path}:/workspace:ro`,
+      `${workspace_path}:/workspace:${workspaceMode}`,
       // Mount Claude credentials read-only
       `${CONFIG.hostHomePath}/.claude:/tmp/claude-creds:ro`,
     ];
@@ -1387,12 +2310,22 @@ async function spawnDockerAgent(args: {
       binds.push(`${tokenFilePath}:/run/secrets/github_token:ro`);
     }
 
-    // Add writable path mounts (these overlay the read-only workspace)
-    for (const writablePath of resolvedWritablePaths) {
-      // Convert host path to container path
-      const relativePath = path.relative(workspace_path, writablePath);
-      const containerPath = path.join("/workspace", relativePath);
-      binds.push(`${writablePath}:${containerPath}:rw`);
+    // Issue #90: Always mount /writable/ as tree-isolated scratch space
+    // Create the tree writable root directory
+    await createTreeWritableDirs(treeId, []);
+    treeWritableDirsCreated = true;
+
+    // Mount the tree root to /writable/ - always available as scratch space
+    const hostTreeWritableRoot = getHostTreeWritableDir(treeId);
+    binds.push(`${hostTreeWritableRoot}:/writable:rw`);
+    envVars.push(`PINOCCHIO_WRITABLE_ROOT=/writable`);
+    envVars.push(`PINOCCHIO_HOST_WRITABLE_ROOT=${hostTreeWritableRoot}`);
+
+    // If specific writable_paths are requested, create those subdirectories
+    if (resolvedWritablePaths.length > 0) {
+      const relativePaths = resolvedWritablePaths.map(p => path.relative(workspace_path, p));
+      await createTreeWritableDirs(treeId, relativePaths);
+      envVars.push(`PINOCCHIO_WRITABLE_PATHS=${relativePaths.join(':')}`);
     }
 
     // Create container with security hardening
@@ -1414,6 +2347,9 @@ async function spawnDockerAgent(args: {
         // or "none" for fully isolated containers (most secure default).
         NetworkMode: allow_docker ? "pinocchio_docker-proxy" : (allow_network ? "bridge" : "none"),
         SecurityOpt: ["no-new-privileges:true"],
+        // Map host.docker.internal to host gateway for Linux compatibility
+        // This allows containers to reach services on the host (like MCP server on port 3001)
+        ExtraHosts: ["host.docker.internal:host-gateway"],
       },
       WorkingDir: "/workspace",
     });
@@ -1423,6 +2359,8 @@ async function spawnDockerAgent(args: {
 
     // Store metadata
     // SECURITY FIX #8: Include tokenFilePath for cleanup when container stops
+    // Issue #45: Initialize hierarchy tracking fields for root agents
+    // Note: treeId and agentSessionToken are now generated before container creation (Issue #57)
     const metadata: AgentMetadata = {
       id: agentId,
       task: sanitizedTask,
@@ -1431,11 +2369,45 @@ async function spawnDockerAgent(args: {
       startedAt: new Date(),
       status: "running",
       tokenFilePath: tokenFilePath || undefined,
+      // Issue #45/49: Hierarchy tracking - root agents have no parent, depth 0
+      // Child agents inherit parent's treeId and set proper depth
+      parentAgentId: args.parent_agent_id,
+      childAgentIds: [],
+      nestingDepth,
+      treeId,
+      // Issue #48: Store session token reference
+      sessionToken: agentSessionToken.token,
     };
     agentMetadata.set(agentId, metadata);
 
+    // Issue #49: For child agents, update parent's childAgentIds and tree agent count
+    if (parentMetadata) {
+      parentMetadata.childAgentIds.push(agentId);
+      console.error(`[pinocchio] Added child ${agentId} to parent ${args.parent_agent_id}'s childAgentIds`);
+
+      // Issue #46: Update tree agent count and max depth
+      await updateTreeAgentCount(treeId, 1);
+      await updateTreeMaxDepth(treeId, nestingDepth);
+
+      // Audit log the nested spawn relationship
+      await auditLog("spawn.nested", {
+        child_agent_id: agentId,
+        tree_id: treeId,
+        nesting_depth: nestingDepth,
+      }, args.parent_agent_id);
+    } else {
+      // Issue #46: Create a SpawnTree to track this root agent's hierarchy
+      createSpawnTree(agentId, treeId);
+    }
+
     // RELIABILITY FIX #4: Persist state when agent starts
     await saveAgentState();
+
+    // Issue #46: Persist tree state when tree is created or updated
+    await saveTreeState();
+
+    // Issue #48: Persist token state when token is created
+    await saveSessionTokenState();
 
     // Start the container
     await container.start();
@@ -1449,7 +2421,13 @@ async function spawnDockerAgent(args: {
 
     // Emit agent.started event via WebSocket
     if (wsServer) {
-      EventBus.getInstance().emitStarted(agentId, sanitizedTask.slice(0, 500), workspace_path);
+      EventBus.getInstance().emitStarted(
+        agentId,
+        sanitizedTask.slice(0, 500),
+        workspace_path,
+        resolvedWritablePaths,
+        { parentAgentId: metadata.parentAgentId, treeId: metadata.treeId, depth: metadata.nestingDepth }
+      );
     }
 
     // SECURITY FIX #5.1: Record spawn timestamp ONLY after successful container start.
@@ -1464,17 +2442,28 @@ async function spawnDockerAgent(args: {
       // Start background monitoring
       monitorAgent(agentId, container, timeout_ms);
 
+      // Issue #49: Build response with optional hierarchy info for nested agents
+      let responseText = `## 🚀 Agent Started (Background)\n\n` +
+        `| Property | Value |\n` +
+        `|----------|-------|\n` +
+        `| **Agent ID** | \`${agentId}\` |\n` +
+        `| **Workspace** | ${workspace_path} |\n` +
+        `| **Access Mode** | ${accessMode} |\n` +
+        `| **Timeout** | ${formatDuration(timeout_ms)} |\n`;
+
+      // Add hierarchy info for nested agents
+      if (args.parent_agent_id) {
+        responseText += `| **Parent Agent** | \`${args.parent_agent_id}\` |\n` +
+          `| **Nesting Depth** | ${nestingDepth} |\n` +
+          `| **Tree ID** | \`${treeId}\` |\n`;
+      }
+
+      responseText += `\nUse \`get_agent_status(agent_id: "${agentId}")\` to check progress.`;
+
       return {
         content: [{
           type: "text" as const,
-          text: `## 🚀 Agent Started (Background)\n\n` +
-            `| Property | Value |\n` +
-            `|----------|-------|\n` +
-            `| **Agent ID** | \`${agentId}\` |\n` +
-            `| **Workspace** | ${workspace_path} |\n` +
-            `| **Access Mode** | ${accessMode} |\n` +
-            `| **Timeout** | ${formatDuration(timeout_ms)} |\n\n` +
-            `Use \`get_agent_status(agent_id: "${agentId}")\` to check progress.`,
+          text: responseText,
         }],
       };
     }
@@ -1502,7 +2491,8 @@ async function spawnDockerAgent(args: {
         foregroundLogStream.on('data', (chunk: Buffer) => {
           if (foregroundDemuxer && eventBus) {
             const messages = foregroundDemuxer.processChunk(chunk);
-            emitLogMessages(agentId, messages, eventBus);
+            const hierarchy = { parentAgentId: metadata.parentAgentId, treeId: metadata.treeId, depth: metadata.nestingDepth };
+            emitLogMessages(agentId, messages, eventBus, hierarchy);
 
             // Process each log line for progress tracking
             for (const msg of messages) {
@@ -1518,6 +2508,7 @@ async function spawnDockerAgent(args: {
               eventBus.emitProgress(
                 agentId,
                 currentProgress,
+                hierarchy,
                 undefined,
                 foregroundProgressTracker.getFilesModified()
               );
@@ -1572,13 +2563,14 @@ async function spawnDockerAgent(args: {
       }, agentId);
 
       // Emit final 100% progress event before completion
+      const hierarchy = { parentAgentId: metadata.parentAgentId, treeId: metadata.treeId, depth: metadata.nestingDepth };
       if (wsServer) {
-        EventBus.getInstance().emitProgress(agentId, 100, undefined, parsed.filesModified);
+        EventBus.getInstance().emitProgress(agentId, 100, hierarchy, undefined, parsed.filesModified);
       }
 
       // Emit agent.completed event via WebSocket
       if (wsServer) {
-        EventBus.getInstance().emitCompleted(agentId, result.StatusCode, duration, parsed.filesModified);
+        EventBus.getInstance().emitCompleted(agentId, result.StatusCode, output, duration, hierarchy, parsed.filesModified);
       }
     } else {
       await auditLog("agent.fail", {
@@ -1588,13 +2580,30 @@ async function spawnDockerAgent(args: {
       }, agentId);
 
       // Emit agent.failed event via WebSocket
+      const hierarchy = { parentAgentId: metadata.parentAgentId, treeId: metadata.treeId, depth: metadata.nestingDepth };
       if (wsServer) {
-        EventBus.getInstance().emitFailed(agentId, 'Non-zero exit code', result.StatusCode, duration);
+        EventBus.getInstance().emitFailed(agentId, 'Non-zero exit code', result.StatusCode, hierarchy, output);
       }
     }
 
+    // Issue #48: Invalidate session token for this agent
+    if (metadata.sessionToken) {
+      invalidateSessionToken(metadata.sessionToken);
+    }
+    invalidateTokensForAgent(agentId);
+
     // RELIABILITY FIX #4: Persist state when agent completes
     await saveAgentState();
+
+    // Issue #91: Cascade terminate children when parent finishes
+    await cascadeTerminateChildren(agentId);
+
+    // Issue #46: Check if the tree should be terminated and persist tree state
+    checkAndTerminateTree(metadata.treeId);
+    await saveTreeState();
+
+    // Issue #48: Persist token state after invalidation
+    await saveSessionTokenState();
 
     // Clean up container (keep metadata for status queries)
     try {
@@ -1615,6 +2624,9 @@ async function spawnDockerAgent(args: {
       ? `\n**Files Modified:**\n${parsed.filesModified.map(f => `- ${f}`).join("\n")}\n`
       : "";
 
+    // Build writable directory info for the result (always available now)
+    const writableDirRow = `| **Writable Dir** | \`${getHostTreeWritableDir(treeId)}\` |\n`;
+
     return {
       content: [{
         type: "text" as const,
@@ -1625,6 +2637,7 @@ async function spawnDockerAgent(args: {
           `| **Duration** | ${formatDuration(duration)} |\n` +
           `| **Workspace** | ${workspace_path} |\n` +
           `| **Writable Paths** | ${resolvedWritablePaths.length > 0 ? resolvedWritablePaths.length + " paths" : "read-only"} |\n` +
+          writableDirRow +
           filesSection +
           `\n**Summary:**\n${parsed.summary}\n\n` +
           `<details><summary>Full Output</summary>\n\n\`\`\`\n${output}\n\`\`\`\n</details>`,
@@ -1648,16 +2661,37 @@ async function spawnDockerAgent(args: {
     runningAgents.delete(agentId);
     const metadata = agentMetadata.get(agentId);
     if (metadata) {
+      // Issue #48: Invalidate session token for this agent
+      if (metadata.sessionToken) {
+        invalidateSessionToken(metadata.sessionToken);
+      }
+      invalidateTokensForAgent(agentId);
+
       metadata.status = "failed";
       metadata.endedAt = new Date();
       // RELIABILITY FIX #4: Persist state when agent fails
       await saveAgentState();
+
+      // Issue #91: Cascade terminate children when parent fails
+      await cascadeTerminateChildren(agentId);
+
+      // Issue #46: Check if the tree should be terminated and persist tree state
+      checkAndTerminateTree(metadata.treeId);
+      await saveTreeState();
+
+      // Issue #48: Persist token state after invalidation
+      await saveSessionTokenState();
     }
 
     // SECURITY FIX #8: Clean up token file on error
     // Use the local variable since metadata may not have been set yet
     if (tokenFilePath) {
       await cleanupTokenFile(tokenFilePath);
+    }
+
+    // Clean up tree writable dirs if spawn fails
+    if (treeWritableDirsCreated && treeId) {
+      await cleanupTreeWritableDir(treeId).catch(() => {});
     }
 
     const errorMessage = error instanceof Error ? error.message : String(error);
@@ -1669,8 +2703,9 @@ async function spawnDockerAgent(args: {
     }, agentId);
 
     // Emit agent.failed event via WebSocket
-    if (wsServer) {
-      EventBus.getInstance().emitFailed(agentId, errorMessage);
+    if (wsServer && metadata) {
+      const hierarchy = { parentAgentId: metadata.parentAgentId, treeId: metadata.treeId, depth: metadata.nestingDepth };
+      EventBus.getInstance().emitFailed(agentId, errorMessage, -1, hierarchy);
     }
 
     return {
@@ -1713,7 +2748,8 @@ async function monitorAgent(agentId: string, container: Docker.Container, timeou
     logStream.on('data', (chunk: Buffer) => {
       if (demuxer && eventBus) {
         const messages = demuxer.processChunk(chunk);
-        emitLogMessages(agentId, messages, eventBus);
+        const hierarchy = { parentAgentId: metadata.parentAgentId, treeId: metadata.treeId, depth: metadata.nestingDepth };
+        emitLogMessages(agentId, messages, eventBus, hierarchy);
 
         // Process each log line for progress tracking
         for (const msg of messages) {
@@ -1729,6 +2765,7 @@ async function monitorAgent(agentId: string, container: Docker.Container, timeou
           eventBus.emitProgress(
             agentId,
             currentProgress,
+            hierarchy,
             undefined,
             progressTracker.getFilesModified()
           );
@@ -1776,13 +2813,14 @@ async function monitorAgent(agentId: string, container: Docker.Container, timeou
       }, agentId);
 
       // Emit final 100% progress event before completion
+      const hierarchy = { parentAgentId: metadata.parentAgentId, treeId: metadata.treeId, depth: metadata.nestingDepth };
       if (wsServer) {
-        EventBus.getInstance().emitProgress(agentId, 100, undefined, parsed.filesModified);
+        EventBus.getInstance().emitProgress(agentId, 100, hierarchy, undefined, parsed.filesModified);
       }
 
       // Emit agent.completed event via WebSocket for background agents
       if (wsServer) {
-        EventBus.getInstance().emitCompleted(agentId, result.StatusCode, duration_ms, parsed.filesModified);
+        EventBus.getInstance().emitCompleted(agentId, result.StatusCode, metadata.output, duration_ms, hierarchy, parsed.filesModified);
       }
     } else {
       await auditLog("agent.fail", {
@@ -1793,13 +2831,30 @@ async function monitorAgent(agentId: string, container: Docker.Container, timeou
       }, agentId);
 
       // Emit agent.failed event via WebSocket for background agents
+      const hierarchy = { parentAgentId: metadata.parentAgentId, treeId: metadata.treeId, depth: metadata.nestingDepth };
       if (wsServer) {
-        EventBus.getInstance().emitFailed(agentId, 'Non-zero exit code', result.StatusCode, duration_ms);
+        EventBus.getInstance().emitFailed(agentId, 'Non-zero exit code', result.StatusCode, hierarchy, metadata.output);
       }
     }
 
+    // Issue #48: Invalidate session token for this agent
+    if (metadata.sessionToken) {
+      invalidateSessionToken(metadata.sessionToken);
+    }
+    invalidateTokensForAgent(agentId);
+
     // RELIABILITY FIX #4: Persist state when background agent completes
     await saveAgentState();
+
+    // Issue #91: Cascade terminate children when parent finishes (background)
+    await cascadeTerminateChildren(agentId);
+
+    // Issue #46: Check if the tree should be terminated and persist tree state
+    checkAndTerminateTree(metadata.treeId);
+    await saveTreeState();
+
+    // Issue #48: Persist token state after invalidation
+    await saveSessionTokenState();
 
     // SECURITY FIX #8: Clean up token file after container completes
     if (metadata.tokenFilePath) {
@@ -1836,12 +2891,29 @@ async function monitorAgent(agentId: string, container: Docker.Container, timeou
     }, agentId);
 
     // Emit agent.failed event via WebSocket for background agent errors
+    const hierarchy = { parentAgentId: metadata.parentAgentId, treeId: metadata.treeId, depth: metadata.nestingDepth };
     if (wsServer) {
-      EventBus.getInstance().emitFailed(agentId, errorMessage, undefined, duration_ms);
+      EventBus.getInstance().emitFailed(agentId, errorMessage, -1, hierarchy, metadata.output);
     }
+
+    // Issue #48: Invalidate session token for this agent
+    if (metadata.sessionToken) {
+      invalidateSessionToken(metadata.sessionToken);
+    }
+    invalidateTokensForAgent(agentId);
 
     // RELIABILITY FIX #4: Persist state when background agent fails
     await saveAgentState();
+
+    // Issue #91: Cascade terminate children when parent fails (background)
+    await cascadeTerminateChildren(agentId);
+
+    // Issue #46: Check if the tree should be terminated and persist tree state
+    checkAndTerminateTree(metadata.treeId);
+    await saveTreeState();
+
+    // Issue #48: Persist token state after invalidation
+    await saveSessionTokenState();
 
     // SECURITY FIX #8: Clean up token file even on error
     if (metadata.tokenFilePath) {
@@ -1919,9 +2991,28 @@ function validateAgentId(agentId: string): { valid: boolean; reason?: string } {
   return { valid: true };
 }
 
+// Issue #64: Helper function to get child agent summaries
+function getChildAgentSummaries(childIds: string[]): ChildAgentSummary[] {
+  return childIds.map(childId => {
+    const childMeta = agentMetadata.get(childId);
+    if (!childMeta) {
+      return {
+        agentId: childId,
+        status: "unknown",
+        task: "(metadata not found)",
+      };
+    }
+    return {
+      agentId: childId,
+      status: childMeta.status,
+      task: childMeta.task.slice(0, 80) + (childMeta.task.length > 80 ? "..." : ""),
+    };
+  });
+}
+
 // Get agent status and output
-async function getAgentStatus(args: { agent_id: string; tail_lines?: number }) {
-  const { agent_id, tail_lines = 100 } = args;
+async function getAgentStatus(args: { agent_id: string; tail_lines?: number; include_children?: boolean }) {
+  const { agent_id, tail_lines = 100, include_children = false } = args;
 
   // SECURITY FIX #14: Validate agent_id format before use
   const idValidation = validateAgentId(agent_id);
@@ -1984,6 +3075,28 @@ async function getAgentStatus(args: { agent_id: string; tail_lines?: number }) {
     ? `\n**Files Modified:**\n${parsed.filesModified.map(f => `- ${f}`).join("\n")}\n`
     : "";
 
+  // Issue #64: Build hierarchy info section for nested agents (always include these fields)
+  const hierarchySection =
+    `| **Tree ID** | \`${metadata.treeId}\` |\n` +
+    `| **Nesting Depth** | ${metadata.nestingDepth} |\n` +
+    (metadata.parentAgentId ? `| **Parent Agent** | \`${metadata.parentAgentId}\` |\n` : "") +
+    `| **Child Count** | ${metadata.childAgentIds.length} |\n` +
+    (metadata.childAgentIds.length > 0
+      ? `| **Child Agent IDs** | ${metadata.childAgentIds.map(id => `\`${id}\``).join(", ")} |\n`
+      : "");
+
+  // Issue #64: Build child agent summaries section if requested
+  let childSummariesSection = "";
+  if (include_children && metadata.childAgentIds.length > 0) {
+    const childSummaries = getChildAgentSummaries(metadata.childAgentIds);
+    childSummariesSection = "\n**Child Agent Details:**\n" +
+      "| Agent ID | Status | Task |\n" +
+      "|----------|--------|------|\n" +
+      childSummaries.map(child =>
+        `| \`${child.agentId}\` | ${child.status} | ${child.task} |`
+      ).join("\n") + "\n";
+  }
+
   return {
     content: [{
       type: "text" as const,
@@ -1996,11 +3109,27 @@ async function getAgentStatus(args: { agent_id: string; tail_lines?: number }) {
         `| **Exit Code** | ${metadata.exitCode ?? "n/a"} |\n` +
         `| **Workspace** | ${metadata.workspacePath} |\n` +
         `| **Writable Paths** | ${metadata.writablePaths.length} |\n` +
+        hierarchySection +
         `| **Task** | ${metadata.task.slice(0, 80)}${metadata.task.length > 80 ? "..." : ""} |\n` +
         filesSection +
+        childSummariesSection +
         `\n**Output** (last ${tail_lines} lines):\n\`\`\`\n${displayOutput}\n\`\`\``,
     }],
   };
+}
+
+// Issue #58: Helper function to update agent metadata for cascade termination
+async function updateAgentMetadataForTermination(
+  agentId: string,
+  status: "failed",
+  output: string
+): Promise<void> {
+  const metadata = agentMetadata.get(agentId);
+  if (metadata && metadata.status === "running") {
+    metadata.status = status;
+    metadata.endedAt = new Date();
+    metadata.output = (metadata.output || "") + "\n" + output;
+  }
 }
 
 // Stop a running agent
@@ -2020,20 +3149,88 @@ async function stopDockerAgent(args: { agent_id: string }) {
   }
 
   try {
+    const metadata = agentMetadata.get(agent_id);
+
+    // Issue #58: Check if this agent has children and use cascade termination
+    if (metadata && metadata.childAgentIds.length > 0) {
+      console.error(`[pinocchio] Agent ${agent_id} has ${metadata.childAgentIds.length} children, using cascade termination`);
+
+      const cascadeResult = await terminateWithChildren(
+        agent_id,
+        "SIGTERM",
+        updateAgentMetadataForTermination,
+        runningAgents
+      );
+
+      // Persist state after cascade termination
+      await saveAgentState();
+
+      // Issue #46: Check if the tree should be terminated
+      checkAndTerminateTree(metadata.treeId);
+      await saveTreeState();
+
+      // Issue #48: Persist token state after invalidation
+      await saveSessionTokenState();
+
+      // AUDIT FIX #9: Log agent stop event with cascade info
+      const duration_ms = metadata.endedAt
+        ? metadata.endedAt.getTime() - metadata.startedAt.getTime()
+        : undefined;
+      await auditLog("agent.stop", {
+        stopped_by: "user",
+        duration_ms,
+        cascade: true,
+        terminated_count: cascadeResult.terminated.length,
+        failed_count: cascadeResult.failed.length,
+      }, agent_id);
+
+      // Build response with cascade information
+      const failedInfo = cascadeResult.failed.length > 0
+        ? `\n\n**Failed to terminate:**\n${cascadeResult.failed.map(f => `- ${f.agentId}: ${f.error}`).join("\n")}`
+        : "";
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `## 🔗 Cascade Termination Complete\n\n` +
+              `**Root Agent:** ${agent_id}\n` +
+              `**Agents Terminated:** ${cascadeResult.terminated.length}\n` +
+              `**Terminated IDs:** ${cascadeResult.terminated.map(id => `\`${id}\``).join(", ")}` +
+              failedInfo,
+          },
+        ],
+      };
+    }
+
+    // No children - use original single-agent termination logic
     const container = docker.getContainer(agent_id);
     await container.stop();
     await container.remove({ force: true });
     runningAgents.delete(agent_id);
 
     // RELIABILITY FIX #4: Update and persist metadata when agent is manually stopped
-    const metadata = agentMetadata.get(agent_id);
     let duration_ms: number | undefined;
     if (metadata && metadata.status === "running") {
       metadata.status = "failed";
       metadata.endedAt = new Date();
       metadata.output = (metadata.output || "") + "\n[pinocchio] Agent manually stopped by user";
       duration_ms = metadata.endedAt.getTime() - metadata.startedAt.getTime();
+
+      // Issue #48: Invalidate session token for this agent
+      if (metadata.sessionToken) {
+        invalidateSessionToken(metadata.sessionToken);
+      }
+      invalidateTokensForAgent(agent_id);
+
       await saveAgentState();
+
+      // Issue #46: Check if the tree should be terminated and persist tree state
+      checkAndTerminateTree(metadata.treeId);
+      await saveTreeState();
+
+      // Issue #48: Persist token state after invalidation
+      await saveSessionTokenState();
     }
 
     // AUDIT FIX #9: Log agent stop event
@@ -2071,8 +3268,12 @@ async function manageConfig(args: {
   reason?: string;
   token?: string;
   default_access?: "none" | "read" | "comment" | "write" | "manage" | "admin";
+  // Issue #47: Nested spawn config params
+  max_depth?: number;
+  max_agents?: number;
+  enable_recursive?: boolean;
 }) {
-  const { action, path: workspacePath, reason, token, default_access } = args;
+  const { action, path: workspacePath, reason, token, default_access, max_depth, max_agents, enable_recursive } = args;
   const config = await loadConfig();
 
   // Parse action into section and subaction
@@ -2287,6 +3488,8 @@ async function manageConfig(args: {
   if (section === "settings" && subaction === "show") {
     const hasGhToken = !!config.github?.token;
     const ghDefault = config.github?.defaultAccess || "none";
+    // Issue #47: Include nested spawn config in settings display
+    const nestedSpawn = getNestedSpawnConfig(config);
 
     return {
       content: [{
@@ -2299,9 +3502,111 @@ async function manageConfig(args: {
           `**🐙 GitHub:**\n` +
           `- Token: ${hasGhToken ? "configured" : "not set"}\n` +
           `- Default access: ${ghDefault}\n\n` +
+          `**🔄 Nested Spawning:**\n` +
+          `- Max depth: ${nestedSpawn.maxNestingDepth}\n` +
+          `- Max agents per tree: ${nestedSpawn.maxAgentsPerTree}\n` +
+          `- Recursive spawn: ${nestedSpawn.enableRecursiveSpawn ? "enabled" : "disabled"}\n\n` +
           `**Config file:** ~/.config/pinocchio/config.json`,
       }],
     };
+  }
+
+  // Issue #47: Handle nested spawn actions
+  if (section === "nestedspawn") {
+    switch (subaction) {
+      case "show": {
+        const nestedSpawn = getNestedSpawnConfig(config);
+        const envOverrides: string[] = [];
+        if (process.env.MAX_NESTING_DEPTH) envOverrides.push("MAX_NESTING_DEPTH");
+        if (process.env.MAX_AGENTS_PER_TREE) envOverrides.push("MAX_AGENTS_PER_TREE");
+        if (process.env.ENABLE_RECURSIVE_SPAWN) envOverrides.push("ENABLE_RECURSIVE_SPAWN");
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: `## 🔄 Nested Spawn Configuration\n\n` +
+              `| Setting | Value | Default |\n` +
+              `|---------|-------|--------|\n` +
+              `| **Max Nesting Depth** | ${nestedSpawn.maxNestingDepth} | ${DEFAULT_NESTED_SPAWN_CONFIG.maxNestingDepth} |\n` +
+              `| **Max Agents Per Tree** | ${nestedSpawn.maxAgentsPerTree} | ${DEFAULT_NESTED_SPAWN_CONFIG.maxAgentsPerTree} |\n` +
+              `| **Recursive Spawn** | ${nestedSpawn.enableRecursiveSpawn ? "enabled" : "disabled"} | ${DEFAULT_NESTED_SPAWN_CONFIG.enableRecursiveSpawn ? "enabled" : "disabled"} |\n\n` +
+              (envOverrides.length > 0
+                ? `**Active Environment Overrides:** ${envOverrides.join(", ")}\n\n`
+                : "") +
+              `**Description:**\n` +
+              `- \`maxNestingDepth\`: Maximum depth of spawning (1 = only direct spawns)\n` +
+              `- \`maxAgentsPerTree\`: Maximum total agents in a single spawn tree\n` +
+              `- \`enableRecursiveSpawn\`: Whether agents can spawn other agents at all`,
+          }],
+        };
+      }
+
+      case "set": {
+        // Validate that at least one parameter is provided
+        if (max_depth === undefined && max_agents === undefined && enable_recursive === undefined) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: `**Error:** At least one parameter is required: max_depth, max_agents, or enable_recursive`,
+            }],
+            isError: true,
+          };
+        }
+
+        // Initialize nestedSpawn in config if not present
+        config.nestedSpawn = config.nestedSpawn || { ...DEFAULT_NESTED_SPAWN_CONFIG };
+
+        // Apply updates
+        const updates: string[] = [];
+        if (max_depth !== undefined) {
+          if (max_depth < 1) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: `**Error:** max_depth must be >= 1, got ${max_depth}`,
+              }],
+              isError: true,
+            };
+          }
+          config.nestedSpawn.maxNestingDepth = max_depth;
+          updates.push(`maxNestingDepth: ${max_depth}`);
+        }
+
+        if (max_agents !== undefined) {
+          if (max_agents < 1) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: `**Error:** max_agents must be >= 1, got ${max_agents}`,
+              }],
+              isError: true,
+            };
+          }
+          config.nestedSpawn.maxAgentsPerTree = max_agents;
+          updates.push(`maxAgentsPerTree: ${max_agents}`);
+        }
+
+        if (enable_recursive !== undefined) {
+          config.nestedSpawn.enableRecursiveSpawn = enable_recursive;
+          updates.push(`enableRecursiveSpawn: ${enable_recursive}`);
+        }
+
+        await saveConfig(config);
+
+        // Audit log the change
+        await auditLog("nestedspawn.set", {
+          updates: updates,
+          new_config: config.nestedSpawn,
+        });
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: `✅ **Nested spawn configuration updated**\n\nChanges:\n${updates.map(u => `- ${u}`).join("\n")}`,
+          }],
+        };
+      }
+    }
   }
 
   // AUDIT FIX #9: Handle audit actions
@@ -2375,6 +3680,7 @@ async function manageConfig(args: {
         `- workspaces.list, workspaces.propose, workspaces.approve, workspaces.reject, workspaces.remove\n` +
         `- github.show, github.set_token, github.remove_token, github.set_default\n` +
         `- settings.show\n` +
+        `- nestedspawn.show, nestedspawn.set\n` +
         `- audit.recent`,
     }],
     isError: true,
@@ -2416,6 +3722,19 @@ async function gracefulShutdown(signal: string): Promise<void> {
   console.error("[pinocchio] Saving agent state before stopping containers...");
   await saveAgentState();
 
+  // Issue #46: Check and terminate all affected trees, then persist tree state
+  const affectedTreeIds = new Set<string>();
+  for (const { agentId } of containersToStop) {
+    const metadata = agentMetadata.get(agentId);
+    if (metadata) {
+      affectedTreeIds.add(metadata.treeId);
+    }
+  }
+  for (const treeId of affectedTreeIds) {
+    checkAndTerminateTree(treeId);
+  }
+  await saveTreeState();
+
   // Now stop all running agent containers (best effort, with timeout)
   if (containersToStop.length > 0) {
     console.error(`[pinocchio] Stopping ${containersToStop.length} container(s)...`);
@@ -2455,6 +3774,23 @@ async function main() {
   // RELIABILITY FIX #4: Load persisted agent state on startup
   await loadAgentState();
 
+  // Issue #46: Load persisted spawn tree state on startup
+  await loadTreeState();
+
+  // Issue #51: Initialize session manager with dependencies from index.ts
+  initSessionManager({
+    getSpawnTree: (treeId) => getSpawnTree(treeId),
+    getAgentMetadata: (agentId) => getAgentMetadata(agentId),
+    auditLog,
+  });
+
+  // Issue #48: Load persisted session token state on startup
+  // Note: Tokens are re-signed with new server secret for running agents
+  await loadSessionTokenState();
+
+  // Issue #48: Start periodic token cleanup
+  startTokenCleanup();
+
   // SECURITY FIX #8.1: Clean up any stale token files from previous sessions.
   // This handles cases where the MCP server was killed (SIGKILL) or crashed
   // without proper cleanup, leaving token files in /tmp/pinocchio-tokens/.
@@ -2469,6 +3805,15 @@ async function main() {
   if (config.websocket?.enabled) {
     wsServer = new PinocchioWebSocket(config.websocket);
     try {
+      // Issue #50: Register handlers for HTTP spawn endpoint
+      wsServer.setSpawnHandler(handleSpawnFromHttp);
+      wsServer.setTokenValidator(validateSessionTokenForHttp);
+
+      // Issue #53: Register quota enforcement handlers
+      wsServer.setTreeInfoGetter(getTreeInfoForHttp);
+      wsServer.setRunningAgentCounter(getRunningAgentCountForHttp);
+      wsServer.setQuotaConfigGetter(getQuotaConfigForHttp);
+
       wsServer.start();
       console.error('[pinocchio] WebSocket server started on port', config.websocket.port);
     } catch (error) {

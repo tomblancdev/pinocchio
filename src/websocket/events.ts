@@ -11,7 +11,17 @@ import {
   AgentProgressEvent,
   AgentCompletedEvent,
   AgentFailedEvent,
+  AgentTerminatedEvent,
 } from './types.js';
+
+/**
+ * Hierarchy info for event emission (Issue #62)
+ */
+export interface HierarchyInfo {
+  parentAgentId?: string;
+  treeId: string;
+  depth: number;
+}
 import { RingBuffer } from './buffer.js';
 
 // ============================================================================
@@ -23,6 +33,7 @@ type AgentEventHandler = (event: AgentEvent) => void;
 export class EventBus extends EventEmitter {
   private static instance: EventBus | null = null;
   private agentBuffers: Map<string, RingBuffer<AgentEvent>> = new Map();
+  private treeBuffers: Map<string, RingBuffer<AgentEvent>> = new Map(); // Issue #63: Tree-level buffers
   private bufferCapacity: number;
 
   private constructor(bufferCapacity = 1000) {
@@ -44,6 +55,7 @@ export class EventBus extends EventEmitter {
     if (EventBus.instance) {
       EventBus.instance.removeAllListeners();
       EventBus.instance.agentBuffers.clear();
+      EventBus.instance.treeBuffers.clear(); // Issue #63
       EventBus.instance = null;
     }
   }
@@ -61,17 +73,36 @@ export class EventBus extends EventEmitter {
     }
     buffer.push(event);
 
+    // Issue #63: Store in tree-specific buffer
+    if (event.treeId) {
+      let treeBuffer = this.treeBuffers.get(event.treeId);
+      if (!treeBuffer) {
+        treeBuffer = new RingBuffer<AgentEvent>(this.bufferCapacity);
+        this.treeBuffers.set(event.treeId, treeBuffer);
+      }
+      treeBuffer.push(event);
+    }
+
     // Emit to listeners
     this.emit('event', event);
     this.emit(`agent:${event.agentId}`, event);
   }
 
-  emitStarted(agentId: string, task: string, workspace: string): void {
+  emitStarted(
+    agentId: string,
+    task: string,
+    workspace: string,
+    writablePaths: string[],
+    hierarchy: HierarchyInfo
+  ): void {
     const event: AgentStartedEvent = {
       type: 'agent.started',
       agentId,
       timestamp: new Date().toISOString(),
-      data: { task, workspace },
+      parentAgentId: hierarchy.parentAgentId,
+      treeId: hierarchy.treeId,
+      depth: hierarchy.depth,
+      data: { task, workspace, writablePaths },
     };
     this.emitEvent(event);
   }
@@ -80,22 +111,35 @@ export class EventBus extends EventEmitter {
     agentId: string,
     level: 'debug' | 'info' | 'warn' | 'error',
     message: string,
+    hierarchy: HierarchyInfo,
     metadata?: Record<string, unknown>
   ): void {
     const event: AgentLogEvent = {
       type: 'agent.log',
       agentId,
       timestamp: new Date().toISOString(),
+      parentAgentId: hierarchy.parentAgentId,
+      treeId: hierarchy.treeId,
+      depth: hierarchy.depth,
       data: { level, message, metadata },
     };
     this.emitEvent(event);
   }
 
-  emitProgress(agentId: string, progress: number, message?: string, filesModified?: string[]): void {
+  emitProgress(
+    agentId: string,
+    progress: number,
+    hierarchy: HierarchyInfo,
+    message?: string,
+    filesModified?: string[]
+  ): void {
     const event: AgentProgressEvent = {
       type: 'agent.progress',
       agentId,
       timestamp: new Date().toISOString(),
+      parentAgentId: hierarchy.parentAgentId,
+      treeId: hierarchy.treeId,
+      depth: hierarchy.depth,
       data: { progress, message, filesModified },
     };
     this.emitEvent(event);
@@ -104,14 +148,19 @@ export class EventBus extends EventEmitter {
   emitCompleted(
     agentId: string,
     exitCode: number,
-    duration: number,
-    filesModified: string[]
+    output: string,
+    durationMs: number,
+    hierarchy: HierarchyInfo,
+    filesModified?: string[]
   ): void {
     const event: AgentCompletedEvent = {
       type: 'agent.completed',
       agentId,
       timestamp: new Date().toISOString(),
-      data: { exitCode, duration, filesModified },
+      parentAgentId: hierarchy.parentAgentId,
+      treeId: hierarchy.treeId,
+      depth: hierarchy.depth,
+      data: { exitCode, output, durationMs, filesModified },
     };
     this.emitEvent(event);
   }
@@ -119,14 +168,36 @@ export class EventBus extends EventEmitter {
   emitFailed(
     agentId: string,
     error: string,
-    exitCode?: number,
-    duration?: number
+    exitCode: number,
+    hierarchy: HierarchyInfo,
+    output?: string
   ): void {
     const event: AgentFailedEvent = {
       type: 'agent.failed',
       agentId,
       timestamp: new Date().toISOString(),
-      data: { error, exitCode, duration },
+      parentAgentId: hierarchy.parentAgentId,
+      treeId: hierarchy.treeId,
+      depth: hierarchy.depth,
+      data: { error, exitCode, output },
+    };
+    this.emitEvent(event);
+  }
+
+  emitTerminated(
+    agentId: string,
+    reason: 'cascade' | 'manual' | 'timeout' | 'orphan_cleanup',
+    hierarchy: HierarchyInfo,
+    terminatedBy?: string
+  ): void {
+    const event: AgentTerminatedEvent = {
+      type: 'agent.terminated',
+      agentId,
+      timestamp: new Date().toISOString(),
+      parentAgentId: hierarchy.parentAgentId,
+      treeId: hierarchy.treeId,
+      depth: hierarchy.depth,
+      data: { reason, terminatedBy },
     };
     this.emitEvent(event);
   }
@@ -160,12 +231,28 @@ export class EventBus extends EventEmitter {
     return buffer ? buffer.toArray() : [];
   }
 
+  /**
+   * Issue #63: Get buffered events for a specific spawn tree.
+   */
+  getBufferedEventsByTree(treeId: string): AgentEvent[] {
+    const buffer = this.treeBuffers.get(treeId);
+    return buffer ? buffer.toArray() : [];
+  }
+
   clearAgentBuffer(agentId: string): void {
     this.agentBuffers.delete(agentId);
   }
 
+  /**
+   * Issue #63: Clear buffered events for a specific spawn tree.
+   */
+  clearTreeBuffer(treeId: string): void {
+    this.treeBuffers.delete(treeId);
+  }
+
   clearAllBuffers(): void {
     this.agentBuffers.clear();
+    this.treeBuffers.clear(); // Issue #63
   }
 }
 
