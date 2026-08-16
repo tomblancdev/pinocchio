@@ -61,26 +61,41 @@ if [ -n "$AGENT_WORKDIR" ] && [ -d "$AGENT_WORKDIR" ]; then
 fi
 
 # Configure spawn proxy MCP server for nested agent spawning
-if [ -n "$PINOCCHIO_API_URL" ] && [ -n "$PINOCCHIO_SESSION_TOKEN" ]; then
-    MCP_CONFIG_DIR="/tmp/claude-mcp-config"
-    mkdir -p "$MCP_CONFIG_DIR"
-    export CLAUDE_MCP_SERVERS_DIR="$MCP_CONFIG_DIR"
-    cat > "$MCP_CONFIG_DIR/mcp_servers.json" << EOF
+# Issue #104: Support both UDS (PINOCCHIO_API_SOCKET) and HTTP (PINOCCHIO_API_URL)
+# Use --mcp-config flag to pass configuration to Claude CLI
+MCP_CONFIG_FLAG=""
+if [ -n "$PINOCCHIO_SESSION_TOKEN" ] && { [ -n "$PINOCCHIO_API_SOCKET" ] || [ -n "$PINOCCHIO_API_URL" ]; }; then
+    MCP_CONFIG_FILE="/tmp/mcp_config.json"
+
+    # Build env vars for spawn-proxy (only include non-empty values)
+    SPAWN_ENV="\"PINOCCHIO_SESSION_TOKEN\": \"$PINOCCHIO_SESSION_TOKEN\""
+    if [ -n "$PINOCCHIO_API_SOCKET" ]; then
+        SPAWN_ENV="$SPAWN_ENV, \"PINOCCHIO_API_SOCKET\": \"$PINOCCHIO_API_SOCKET\""
+    fi
+    if [ -n "$PINOCCHIO_API_URL" ]; then
+        SPAWN_ENV="$SPAWN_ENV, \"PINOCCHIO_API_URL\": \"$PINOCCHIO_API_URL\""
+    fi
+    if [ -n "$PINOCCHIO_HOST_WORKSPACE" ]; then
+        SPAWN_ENV="$SPAWN_ENV, \"PINOCCHIO_HOST_WORKSPACE\": \"$PINOCCHIO_HOST_WORKSPACE\""
+    fi
+
+    cat > "$MCP_CONFIG_FILE" << EOF
 {
-  "spawn-proxy": {
-    "command": "/usr/local/bin/spawn-proxy",
-    "args": [],
-    "env": {
-      "PINOCCHIO_API_URL": "$PINOCCHIO_API_URL",
-      "PINOCCHIO_SESSION_TOKEN": "$PINOCCHIO_SESSION_TOKEN",
-      "PINOCCHIO_HOST_WORKSPACE": "$PINOCCHIO_HOST_WORKSPACE"
+  "mcpServers": {
+    "spawn-proxy": {
+      "command": "/usr/local/bin/spawn-proxy",
+      "args": [],
+      "env": {
+        $SPAWN_ENV
+      }
     }
   }
 }
 EOF
-    echo "[entrypoint] Spawn proxy MCP server configured"
+    MCP_CONFIG_FLAG="--mcp-config $MCP_CONFIG_FILE"
+    echo "[entrypoint] Spawn proxy MCP server configured (socket: ${PINOCCHIO_API_SOCKET:-none}, url: ${PINOCCHIO_API_URL:-none})"
 else
-    echo "[entrypoint] Spawn proxy not configured (PINOCCHIO_API_URL or PINOCCHIO_SESSION_TOKEN not set)"
+    echo "[entrypoint] Spawn proxy not configured (need PINOCCHIO_SESSION_TOKEN and either PINOCCHIO_API_SOCKET or PINOCCHIO_API_URL)"
 fi
 
 echo "╔══════════════════════════════════════════╗"
@@ -93,6 +108,9 @@ echo "╚═══════════════════════�
 # Run Claude Code in print mode (non-interactive) with dangerously-skip-permissions
 # --print: Run in non-interactive mode, execute the prompt and exit
 # --dangerously-skip-permissions: Skip all permission prompts (YOLO mode)
+# --mcp-config: Load MCP servers for nested agent spawning (if configured)
+# shellcheck disable=SC2086
 exec claude --print \
     --dangerously-skip-permissions \
+    $MCP_CONFIG_FLAG \
     "$AGENT_TASK"
